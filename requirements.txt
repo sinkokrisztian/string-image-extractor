@@ -1,0 +1,7 @@
+pandas
+openpyxl
+Pillow
+pytesseract
+pydantic
+openai
+tkinterdnd2

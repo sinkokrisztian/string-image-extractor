@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# OCR/AI caches
+.ocr_ai_cache/
+.ocr_llm_norm_cache/
+
+# Generated reports and logs
+*.log
+*.xlsx
+*_ai_audit.html
+
+# Build/release artifacts
+dist/
+build/
+output/release/
+
+# OS/editor
+.DS_Store
+Thumbs.db
