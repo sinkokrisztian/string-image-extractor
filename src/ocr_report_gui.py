@@ -24,6 +24,7 @@ MODE_CALLS_PER_PAIR = {
     "classic_llm": 2,
     "ai": 2,
     "hybrid": 2,
+    "ai_validated": 3,
     "triangulated": 4,
 }
 
@@ -44,10 +45,10 @@ MODE_PRESETS = {
         "description": "No OpenAI calls. Best for checking image pairing and raw Tesseract evidence.",
     },
     "Balanced AI": {
-        "engine": "hybrid",
+        "engine": "ai_validated",
         "matching": "llm_objects",
         "pairs": 1,
-        "description": "Classic OCR plus direct AI image OCR, then object matching.",
+        "description": "AI OCR primary extraction with raw OCR corroboration and semantic validation.",
     },
     "Best quality": {
         "engine": "triangulated",
@@ -76,7 +77,7 @@ class OCRReportGUI(BaseTk):
         self.target_lang_var = tk.StringVar(value="hu")
         self.target_ocr_var = tk.StringVar(value="hun")
         self.source_ocr_var = tk.StringVar(value="eng")
-        self.engine_var = tk.StringVar(value="triangulated")
+        self.engine_var = tk.StringVar(value="ai_validated")
         self.matching_var = tk.StringVar(value="llm_objects")
         self.ai_model_var = tk.StringVar(value="gpt-4.1-mini")
         self.llm_model_var = tk.StringVar(value="gpt-4.1-mini")
@@ -94,7 +95,7 @@ class OCRReportGUI(BaseTk):
         self.output_tokens_var = tk.IntVar(value=1200)
         self.cost_var = tk.StringVar(value="")
         self.call_count_var = tk.StringVar(value="")
-        self.preset_hint_var = tk.StringVar(value=MODE_PRESETS["Best quality"]["description"])
+        self.preset_hint_var = tk.StringVar(value=MODE_PRESETS["Balanced AI"]["description"])
         self.drop_hint_var = tk.StringVar(value="Drop a project folder here, or drop an EPS image to set the filename filter")
         self.status_var = tk.StringVar(value="Ready")
 
@@ -349,7 +350,7 @@ class OCRReportGUI(BaseTk):
         pair_count = max(0, self._safe_int(self.pair_count_var))
         input_tokens = max(0, self._safe_int(self.input_tokens_var))
         output_tokens = max(0, self._safe_int(self.output_tokens_var))
-        model = self.ai_model_var.get() if self.engine_var.get() in {"ai", "hybrid", "triangulated"} else self.llm_model_var.get()
+        model = self.ai_model_var.get() if self.engine_var.get() in {"ai", "hybrid", "triangulated", "ai_validated"} else self.llm_model_var.get()
         price = MODEL_PRICES_PER_1M.get(model, MODEL_PRICES_PER_1M["gpt-4.1-mini"])
         call_count = pair_count * calls
         estimate = call_count * ((input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price["output"])
@@ -389,6 +390,8 @@ class OCRReportGUI(BaseTk):
             self.log_var.get(),
             "--verbose",
         ]
+        if self.engine_var.get() == "triangulated":
+            cmd.append("--expert-debug-mode")
         if self.audit_enabled_var.get():
             cmd.extend(["--ai-audit-html", self.audit_var.get()])
         else:

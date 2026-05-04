@@ -2,6 +2,9 @@
 
 This document explains every tab and every column in `report_gui.xlsx`: what it means and how it is generated.
 
+Note: the current default runtime is `--ocr-engine ai_validated`.  
+Legacy triangulated outputs remain available in expert/debug mode.
+
 ---
 
 ## 1) Tab: `Image pairs`
@@ -182,6 +185,15 @@ Purpose: final source-to-target string mapping result after object matching (LLM
 - `source_screen_area`: Source screen area.
 - `target_screen_area`: Target screen area.
 - `triangulation_agreement_score`: Agreement-derived score used in confidence fusion.
+- `source_object_lane`: Pre-semantic lane classification for source object (`translatable_gui`, `value_only`, `masked_text`, `map_background`, `decorative_status`, `unknown_review`).
+- `target_object_lane`: Same lane classification for target object.
+- `raw_ocr_validation_status`: Corroboration result against target-side unfiltered `full_text_by_pass` (`confirmed`, `weakly_confirmed`, `not_confirmed`).
+- `raw_ocr_validation_reason`: Reason/details for corroboration status.
+- `semantic_check_status`: Pair-level semantic QA classifier (`ok`, `warning`, `mismatch`).
+- `semantic_check_confidence`: Confidence of semantic QA classifier.
+- `semantic_check_reason`: Short rationale from semantic QA checker.
+- `source_guided_conflict`: True when source-context conflict is detected (review-only handling).
+- `suggested_target_candidate`: Optional hint candidate shown for review; never a silent overwrite.
 
 How generated:
 - Usually via `match_objects_with_llm` + `validate_gui_matches` + confidence/status recalculation.

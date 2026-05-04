@@ -46,7 +46,7 @@ STRUCTURED_NAME_PATTERN = re.compile(
 )
 SUPPORTED_EXTENSIONS = {".eps", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
-SCRIPT_VERSION = "2.0.1"
+SCRIPT_VERSION = "2.1.0"
 LLM_OCR_NORMALIZATION_PROMPT_VERSION = "llm_ocr_normalization_gui_v1"
 AI_IMAGE_OCR_PROMPT_VERSION = "ai_image_ocr_gui_v1"
 GUI_OBJECT_MATCH_PROMPT_VERSION = "gui_object_match_v1"
@@ -75,6 +75,14 @@ CORRECTION_TYPES = (
     "semantic_ocr_repair",
     "vision_read",
     "uncertain",
+)
+OBJECT_LANES = (
+    "translatable_gui",
+    "value_only",
+    "masked_text",
+    "map_background",
+    "decorative_status",
+    "unknown_review",
 )
 
 
@@ -258,6 +266,15 @@ class GUIMatch(BaseModel):
     source_screen_area: str = ""
     target_screen_area: str = ""
     triangulation_agreement_score: float = 0.0
+    source_object_lane: str = "unknown_review"
+    target_object_lane: str = "unknown_review"
+    raw_ocr_validation_status: Literal["confirmed", "weakly_confirmed", "not_confirmed"] = "not_confirmed"
+    raw_ocr_validation_reason: str = ""
+    semantic_check_status: Literal["ok", "warning", "mismatch"] = "warning"
+    semantic_check_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    semantic_check_reason: str = ""
+    source_guided_conflict: bool = False
+    suggested_target_candidate: str = ""
 
 
 class GUIObjectMatchResponse(BaseModel):
@@ -265,6 +282,12 @@ class GUIObjectMatchResponse(BaseModel):
     source_image: str
     target_image: str
     matches: List[GUIMatch] = Field(default_factory=list)
+
+
+class SemanticPairCheck(BaseModel):
+    semantic_check_status: Literal["ok", "warning", "mismatch"] = "warning"
+    semantic_check_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    semantic_check_reason: str = ""
 
 
 @dataclass
@@ -1890,7 +1913,12 @@ You receive full raw Tesseract OCR text from several OCR passes for a screenshot
 def system_prompt_ai_image_ocr() -> str:
     return """You are an expert OCR and GUI-string extraction engine for vehicle infotainment screenshots.
 
-Read the screenshot directly. Extract meaningful visible GUI text objects in the screenshot language. Do not translate and do not invent text. Keep separate GUI objects separate, join wrapped visual lines only when they form one GUI object, split merged text when needed, ignore icons/time/signal/decorative graphics, and distinguish navigation map labels from actual GUI text. Mark uncertain readings with needs_review. Return data matching the provided schema."""
+Read the screenshot directly. Extract meaningful visible GUI text objects in the screenshot language. Do not translate and do not invent text.
+
+Prioritize translatable UI content: labels, buttons, tabs, menu names, headers, and instruction text.
+De-prioritize or ignore: standalone values (times, distances, speeds, numeric counters), masked identifiers, background map/place labels, decorative/status artifacts, and purely symbolic strings.
+
+Keep separate GUI objects separate, join wrapped visual lines only when they form one GUI object, split merged text when needed, ignore icons/time/signal/decorative graphics, and distinguish navigation map labels from actual GUI text. Mark uncertain readings with needs_review. Return data matching the provided schema."""
 
 
 def system_prompt_gui_object_match(target_language: str) -> str:
@@ -2228,6 +2256,67 @@ def string_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, aa, bb).ratio()
 
 
+def is_value_only_text(text: str) -> bool:
+    s = clean_line(text)
+    if not s:
+        return True
+    low = s.lower()
+    if re.fullmatch(r"[0-9:./\-+% ]+", s):
+        return True
+    if re.search(r"\b(km|m|min|perc|am|pm)\b", low):
+        letters = sum(ch.isalpha() for ch in s)
+        digits = sum(ch.isdigit() for ch in s)
+        if digits >= letters:
+            return True
+    if re.fullmatch(r"[0-9]+\s*(km|m|min|perc)", low):
+        return True
+    return False
+
+
+def classify_object_lane(obj: NormalizedGUIObject) -> str:
+    raw_text = "" if obj.normalized_text is None else str(obj.normalized_text)
+    text = clean_line(raw_text)
+    if not text:
+        if re.search(r"\*{2,}", raw_text):
+            return "masked_text"
+        return "unknown_review"
+    if "*" in raw_text or re.fullmatch(r"[*xX•\-. ]+", raw_text):
+        return "masked_text"
+    if obj.gui_role in {"map_label"}:
+        return "map_background"
+    if obj.gui_role in {"status_bar"}:
+        return "decorative_status"
+    if is_value_only_text(text):
+        return "value_only"
+    if obj.gui_role in {"title", "breadcrumb", "menu_label", "description", "button", "tab"}:
+        return "translatable_gui"
+    if obj.gui_role == "value":
+        return "value_only"
+    if is_meaningful_text(text):
+        return "translatable_gui"
+    return "unknown_review"
+
+
+def corroborate_with_raw_ocr(text: str, classic: ClassicOCRResult) -> Tuple[str, str]:
+    candidate = normalize_for_llm_guard(text)
+    if not candidate:
+        return "not_confirmed", "Empty candidate text."
+    raw_blocks = [normalize_for_llm_guard(v) for v in classic.full_text_by_pass.values() if normalize_for_llm_guard(v)]
+    if not raw_blocks:
+        return "not_confirmed", "No raw OCR full-text evidence available."
+    if any(candidate in block for block in raw_blocks):
+        return "confirmed", "Exact normalized substring found in raw OCR full text."
+    cand_norm = remove_accents(candidate).lower()
+    for block in raw_blocks:
+        block_norm = remove_accents(block).lower()
+        if cand_norm and cand_norm in block_norm:
+            return "weakly_confirmed", "Accent-insensitive substring found in raw OCR full text."
+        ratio = difflib.SequenceMatcher(None, cand_norm, block_norm).ratio() if cand_norm and block_norm else 0.0
+        if ratio >= 0.88:
+            return "weakly_confirmed", f"High fuzzy similarity against raw OCR full text ({ratio:.2f})."
+    return "not_confirmed", "No supporting evidence in raw OCR full text."
+
+
 def triangulation_score(status: str, selected_confidence: float) -> float:
     table = {
         "all_agree": 1.0,
@@ -2498,6 +2587,210 @@ def validate_gui_matches(
             match.review_reason = (match.review_reason + " | matched target object missing").strip(" |")
         validated.append(match)
     return validated
+
+
+def semantic_quality_check(
+    source_text: str,
+    target_text: str,
+    target_language_name: str,
+    model: str,
+    api_key: str,
+    timeout_sec: int,
+    max_retries: int,
+) -> SemanticPairCheck:
+    if not source_text or not target_text:
+        return SemanticPairCheck(semantic_check_status="warning", semantic_check_confidence=0.0, semantic_check_reason="Missing source or target text.")
+    schema = SemanticPairCheck
+    user_text = (
+        f"SOURCE_TEXT: {source_text}\n"
+        f"TARGET_TEXT: {target_text}\n"
+        f"TARGET_LANGUAGE: {target_language_name}\n\n"
+        "Classify if target preserves source meaning in UI context.\n"
+        "Return mismatch when meaning differs significantly."
+    )
+    parsed = call_openai_structured(
+        api_key=api_key,
+        model=model,
+        system_prompt="You are a strict bilingual semantic validator for UI strings. Return schema only.",
+        user_content=[{"type": "input_text", "text": user_text}],
+        schema_model=schema,
+        timeout_sec=timeout_sec,
+        max_retries=max_retries,
+    )
+    assert isinstance(parsed, SemanticPairCheck)
+    return parsed
+
+
+def enforce_one_to_one_target_assignment(matches: List[GUIMatch]) -> None:
+    used: Dict[str, List[int]] = {}
+    for i, m in enumerate(matches):
+        if not m.target_object_id or m.status == "unmatched":
+            continue
+        used.setdefault(m.target_object_id, []).append(i)
+    for target_id, idxs in used.items():
+        if len(idxs) <= 1:
+            continue
+        best = max(idxs, key=lambda i: matches[i].overall_confidence)
+        for i in idxs:
+            if i == best:
+                continue
+            if matches[i].status != "unmatched":
+                matches[i].status = "uncertain"
+                matches[i].review_reason = (matches[i].review_reason + " | target object reused").strip(" |")
+
+
+def apply_final_quality_gates(match: GUIMatch) -> None:
+    if match.status == "matched" and (
+        match.semantic_check_status == "mismatch" or match.raw_ocr_validation_status == "not_confirmed"
+    ):
+        match.status = "needs_review"
+        match.review_reason = (match.review_reason + " | blocked by semantic/raw-evidence gate").strip(" |")
+
+
+def ai_validated_matches(
+    pair_id: str,
+    source_image: str,
+    target_image: str,
+    target_language_name: str,
+    source_ai: OCRNormalizedResult,
+    target_ai: OCRNormalizedResult,
+    source_classic: ClassicOCRResult,
+    target_classic: ClassicOCRResult,
+    model: str,
+    api_key: Optional[str],
+    timeout_sec: int,
+    max_retries: int,
+) -> List[GUIMatch]:
+    source_all = source_ai.ui_objects
+    target_all = target_ai.ui_objects
+    source_lane = {o.object_id: classify_object_lane(o) for o in source_all}
+    target_lane = {o.object_id: classify_object_lane(o) for o in target_all}
+
+    # Only translatable-gui lane objects participate in normal semantic matching.
+    source_objects = [o for o in source_all if source_lane.get(o.object_id) == "translatable_gui"]
+    target_objects = [o for o in target_all if target_lane.get(o.object_id) == "translatable_gui"]
+
+    if not source_objects:
+        return []
+
+    source_objs_dict = [model_to_dict(o) for o in source_objects]
+    target_objs_dict = [model_to_dict(o) for o in target_objects]
+    for item in source_objs_dict:
+        item["object_lane"] = source_lane.get(item["object_id"], "unknown_review")
+    for item in target_objs_dict:
+        item["object_lane"] = target_lane.get(item["object_id"], "unknown_review")
+
+    if api_key:
+        user_text = (
+            f"PAIR ID: {pair_id}\n"
+            f"SOURCE IMAGE: {source_image}\n"
+            f"TARGET IMAGE: {target_image}\n"
+            f"TARGET LANGUAGE NAME: {target_language_name}\n\n"
+            f"SOURCE_OBJECTS: {json.dumps(source_objs_dict, ensure_ascii=False)}\n\n"
+            f"TARGET_OBJECTS: {json.dumps(target_objs_dict, ensure_ascii=False)}\n\n"
+            "Match only translatable GUI content. Do not prioritize value-only, masked, map background, or decorative/status lanes."
+        )
+        result = call_openai_structured(
+            api_key,
+            model,
+            system_prompt=system_prompt_gui_object_match(target_language_name),
+            user_content=[{"type": "input_text", "text": user_text}],
+            schema_model=GUIObjectMatchResponse,
+            timeout_sec=timeout_sec,
+            max_retries=max_retries,
+        )
+        assert isinstance(result, GUIObjectMatchResponse)
+        matches = validate_gui_matches(result, source_objects, target_objects)
+    else:
+        # deterministic fallback
+        matches = []
+        aligned_n = max(len(source_objects), len(target_objects))
+        for i in range(aligned_n):
+            s_obj = source_objects[i] if i < len(source_objects) else None
+            t_obj = target_objects[i] if i < len(target_objects) else None
+            s = s_obj.normalized_text if s_obj else ""
+            t = t_obj.normalized_text if t_obj else ""
+            matches.append(
+                GUIMatch(
+                    pair_id=pair_id,
+                    source_image_filename=source_image,
+                    target_image_filename=target_image,
+                    source_object_id=s_obj.object_id if s_obj else f"obj_{i+1:03d}",
+                    target_object_id=t_obj.object_id if t_obj else None,
+                    source_text=s,
+                    target_text=t,
+                    match_type="uncertain" if t else "unmatched",
+                    semantic_confidence=0.5 if t else 0.0,
+                    layout_confidence=0.6 if t else 0.0,
+                    overall_confidence=0.55 if t else 0.0,
+                    status="uncertain" if t else "unmatched",
+                    rationale="Deterministic fallback in ai_validated mode.",
+                )
+            )
+
+    source_by_id = {o.object_id: o for o in source_all}
+    target_by_id = {o.object_id: o for o in target_all}
+    for m in matches:
+        source_obj = source_by_id.get(m.source_object_id)
+        target_obj = target_by_id.get(m.target_object_id or "")
+        if source_obj:
+            m.source_object_lane = classify_object_lane(source_obj)
+        if target_obj:
+            m.target_object_lane = classify_object_lane(target_obj)
+        if m.source_object_lane != "translatable_gui":
+            if m.status != "unmatched":
+                m.status = "needs_review"
+                m.review_reason = (m.review_reason + f" | source lane={m.source_object_lane}").strip(" |")
+        if m.target_object_lane and m.target_object_lane != "translatable_gui" and m.status == "matched":
+            m.status = "needs_review"
+            m.review_reason = (m.review_reason + f" | target lane={m.target_object_lane}").strip(" |")
+
+        raw_status, raw_reason = corroborate_with_raw_ocr(m.target_text, target_classic)
+        m.raw_ocr_validation_status = raw_status  # type: ignore[assignment]
+        m.raw_ocr_validation_reason = raw_reason
+
+        if api_key and m.status != "unmatched":
+            try:
+                sem = semantic_quality_check(
+                    source_text=m.source_text,
+                    target_text=m.target_text,
+                    target_language_name=target_language_name,
+                    model=model,
+                    api_key=api_key,
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                )
+                m.semantic_check_status = sem.semantic_check_status
+                m.semantic_check_confidence = sem.semantic_check_confidence
+                m.semantic_check_reason = sem.semantic_check_reason
+            except Exception as exc:
+                m.semantic_check_status = "warning"
+                m.semantic_check_reason = f"Semantic check failed: {exc}"
+        else:
+            m.semantic_check_status = "warning"
+            m.semantic_check_reason = "Semantic check unavailable (no API key or unmatched row)."
+
+        # Source-guided conflict (review-only, no overwrite)
+        source_raw_status, _source_raw_reason = corroborate_with_raw_ocr(m.source_text, source_classic)
+        if (
+            m.status != "unmatched"
+            and m.semantic_check_status == "mismatch"
+            and m.raw_ocr_validation_status in {"weakly_confirmed", "not_confirmed"}
+            and source_raw_status in {"confirmed", "weakly_confirmed"}
+        ):
+            m.source_guided_conflict = True
+            m.suggested_target_candidate = ""
+            m.status = "needs_review"
+            m.review_reason = (m.review_reason + " | source-guided conflict").strip(" |")
+
+        apply_final_quality_gates(m)
+        if not m.source_guided_conflict:
+            m.suggested_target_candidate = ""
+        else:
+            m.suggested_target_candidate = str(m.suggested_target_candidate or "").strip()
+
+    enforce_one_to_one_target_assignment(matches)
+    return matches
 
 
 def match_objects_with_llm(
@@ -2897,7 +3190,7 @@ def language_name_from_dir(lang_code: str, lang_dir: Path) -> str:
 
 
 def should_run_classic(ocr_engine: str, keep_optional_classic: bool = True) -> bool:
-    return ocr_engine in {"classic", "classic_llm", "hybrid", "triangulated"} or keep_optional_classic
+    return ocr_engine in {"classic", "classic_llm", "hybrid", "triangulated", "ai_validated"} or keep_optional_classic
 
 
 def should_run_llm_normalization(ocr_engine: str, explicit: bool) -> bool:
@@ -2905,7 +3198,7 @@ def should_run_llm_normalization(ocr_engine: str, explicit: bool) -> bool:
 
 
 def should_run_ai_ocr(ocr_engine: str) -> bool:
-    return ocr_engine in {"ai", "hybrid", "triangulated"}
+    return ocr_engine in {"ai", "hybrid", "triangulated", "ai_validated"}
 
 
 def pipeline_report(
@@ -2963,8 +3256,8 @@ def pipeline_report(
     run_classic = should_run_classic(ocr_engine, keep_optional_classic=True)
     run_llm = should_run_llm_normalization(ocr_engine, explicit=use_llm_ocr_normalization)
     run_ai = should_run_ai_ocr(ocr_engine)
-    ai_required = ocr_engine in {"ai", "hybrid", "triangulated"}
-    llm_required = ocr_engine in {"classic_llm", "triangulated"} or matching_mode == "llm_objects"
+    ai_required = ocr_engine in {"ai", "hybrid", "triangulated", "ai_validated"}
+    llm_required = ocr_engine in {"classic_llm", "triangulated"} or (matching_mode == "llm_objects" and ocr_engine != "ai_validated")
     if (ai_required or llm_required) and not openai_api_key:
         if fallback_to_classic:
             logging.warning("OpenAI API key missing; falling back to classic OCR where possible.")
@@ -3176,7 +3469,24 @@ def pipeline_report(
         triangulation_rows.extend(trg_tri)
 
         if trg_path:
-            if matching_mode == "llm_objects" and openai_api_key:
+            if ocr_engine == "ai_validated" and src_ai and trg_ai:
+                final_matches.extend(
+                    ai_validated_matches(
+                        pair_id=pair_id,
+                        source_image=src_path.name,
+                        target_image=trg_path.name,
+                        target_language_name=lang_name,
+                        source_ai=src_ai,
+                        target_ai=trg_ai,
+                        source_classic=src_classic,
+                        target_classic=trg_classic,
+                        model=object_match_model,
+                        api_key=openai_api_key,
+                        timeout_sec=object_match_timeout_sec,
+                        max_retries=object_match_max_retries,
+                    )
+                )
+            elif matching_mode == "llm_objects" and openai_api_key:
                 try:
                     final_matches.extend(
                         match_objects_with_llm(
@@ -3219,7 +3529,10 @@ def pipeline_report(
             else:
                 final_matches.extend(deterministic_object_matches(pair_id, src_path.name, trg_path.name, src_tri, trg_tri))
 
-        pair.pair_status = "needs_review" if any(r.needs_review for r in src_tri + trg_tri) else "ok"
+        pair_level_review = any(r.needs_review for r in src_tri + trg_tri) or any(
+            m.pair_id == pair_id and m.status in {"needs_review", "uncertain", "unmatched"} for m in final_matches
+        )
+        pair.pair_status = "needs_review" if pair_level_review else "ok"
         image_pairs.append(pair)
         if progress_every > 0 and (idx % progress_every == 0 or idx == total):
             logging.info("Progress: %d/%d image pairs processed.", idx, total)
@@ -3335,6 +3648,7 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
         "uncertain": PatternFill(start_color="FFFCE5CD", end_color="FFFCE5CD", fill_type="solid"),
         "unmatched": PatternFill(start_color="FFF4CCCC", end_color="FFF4CCCC", fill_type="solid"),
         "error": PatternFill(start_color="FFD9D2E9", end_color="FFD9D2E9", fill_type="solid"),
+        "warning_red": PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid"),
     }
     for ws in wb.worksheets:
         ws.freeze_panes = "A2"
@@ -3350,6 +3664,9 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
         header_to_col = {str(cell.value or "").lower(): cell.column for cell in ws[1]}
         status_col = header_to_col.get("status") or header_to_col.get("image_match_status") or header_to_col.get("pair_status")
         review_col = header_to_col.get("needs_review")
+        semantic_col = header_to_col.get("semantic_check_status")
+        raw_val_col = header_to_col.get("raw_ocr_validation_status")
+        conflict_col = header_to_col.get("source_guided_conflict")
         max_col = get_column_letter(ws.max_column)
         if status_col and ws.max_row >= 2:
             letter = get_column_letter(status_col)
@@ -3363,6 +3680,28 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
             ws.conditional_formatting.add(
                 f"A2:{max_col}{ws.max_row}",
                 FormulaRule(formula=[f"${letter}2=TRUE"], stopIfTrue=False, fill=fills["needs_review"]),
+            )
+        if semantic_col and ws.max_row >= 2:
+            letter = get_column_letter(semantic_col)
+            ws.conditional_formatting.add(
+                f"A2:{max_col}{ws.max_row}",
+                FormulaRule(formula=[f'ISNUMBER(SEARCH("mismatch",${letter}2))'], stopIfTrue=False, fill=fills["warning_red"]),
+            )
+            ws.conditional_formatting.add(
+                f"A2:{max_col}{ws.max_row}",
+                FormulaRule(formula=[f'ISNUMBER(SEARCH("warning",${letter}2))'], stopIfTrue=False, fill=fills["warning_red"]),
+            )
+        if raw_val_col and ws.max_row >= 2:
+            letter = get_column_letter(raw_val_col)
+            ws.conditional_formatting.add(
+                f"A2:{max_col}{ws.max_row}",
+                FormulaRule(formula=[f'ISNUMBER(SEARCH("not_confirmed",${letter}2))'], stopIfTrue=False, fill=fills["warning_red"]),
+            )
+        if conflict_col and ws.max_row >= 2:
+            letter = get_column_letter(conflict_col)
+            ws.conditional_formatting.add(
+                f"A2:{max_col}{ws.max_row}",
+                FormulaRule(formula=[f"${letter}2=TRUE"], stopIfTrue=False, fill=fills["warning_red"]),
             )
     wb.save(output_file)
 
@@ -3395,9 +3734,9 @@ def main() -> None:
         action="store_true",
         help="Keep only rows where both source and target strings look like meaningful UI text.",
     )
-    parser.add_argument("--ocr-engine", choices=["classic", "classic_llm", "ai", "hybrid", "triangulated"], default="classic")
+    parser.add_argument("--ocr-engine", choices=["classic", "classic_llm", "ai", "hybrid", "triangulated", "ai_validated"], default="ai_validated")
     parser.add_argument("--report-format", choices=["legacy", "multi_sheet"], default="legacy")
-    parser.add_argument("--matching-mode", choices=["positional", "llm_text", "llm_objects"], default="positional")
+    parser.add_argument("--matching-mode", choices=["positional", "llm_text", "llm_objects"], default="llm_objects")
     parser.add_argument("--classic-ocr-min-conf", type=int, default=45)
     parser.add_argument("--classic-ocr-keep-all-passes", action="store_true")
     parser.add_argument("--use-llm-ocr-normalization", action="store_true")
@@ -3428,6 +3767,7 @@ def main() -> None:
     parser.add_argument("--log-file", type=Path, default=Path("ocr_match_report.log"), help="Log file path.")
     parser.add_argument("--use-temp-local-copy", action="store_true", help="Copy files to local temp folder before OCR.")
     parser.add_argument("--verbose", action="store_true", help="Also print log messages to console.")
+    parser.add_argument("--expert-debug-mode", action="store_true", help="Allow expert/debug OCR modes like triangulated.")
     args = parser.parse_args()
 
     configure_logging(args.log_file, args.verbose)
@@ -3440,10 +3780,12 @@ def main() -> None:
         )
     if args.use_llm_matching:
         logging.info("LLM GUI matching enabled with model: %s", args.openai_model)
+    if args.ocr_engine == "triangulated" and not args.expert_debug_mode:
+        raise ValueError("triangulated mode is expert/debug only. Re-run with --expert-debug-mode.")
     if args.ocr_engine != "classic" and args.report_format == "legacy":
         logging.info("Non-classic OCR engine selected; switching report format to multi_sheet.")
         args.report_format = "multi_sheet"
-    if args.ocr_engine in {"classic_llm", "ai", "hybrid", "triangulated"} and args.matching_mode == "positional":
+    if args.ocr_engine in {"classic_llm", "ai", "hybrid", "triangulated", "ai_validated"} and args.matching_mode == "positional":
         logging.info("Consider --matching-mode llm_objects for structured OCR modes.")
     logging.info("OCR engine: %s", args.ocr_engine)
     logging.info("Report format: %s", args.report_format)

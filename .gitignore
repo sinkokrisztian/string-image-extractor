@@ -21,6 +21,7 @@ venv/
 dist/
 build/
 output/release/
+output/
 
 # OS/editor
 .DS_Store
