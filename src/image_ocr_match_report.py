@@ -15,6 +15,10 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+import uuid
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Literal, List, Optional, Sequence, Tuple
@@ -46,7 +50,7 @@ STRUCTURED_NAME_PATTERN = re.compile(
 )
 SUPPORTED_EXTENSIONS = {".eps", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
-SCRIPT_VERSION = "2.1.0"
+SCRIPT_VERSION = "2.2.0"
 LLM_OCR_NORMALIZATION_PROMPT_VERSION = "llm_ocr_normalization_gui_v1"
 AI_IMAGE_OCR_PROMPT_VERSION = "ai_image_ocr_gui_v1"
 GUI_OBJECT_MATCH_PROMPT_VERSION = "gui_object_match_v1"
@@ -309,6 +313,7 @@ class PipelineReport:
     image_pairs: List[ImagePair]
     classic_lines: List[OCRLine]
     classic_tokens: List[OCRToken]
+    raw_ocr_full_text: List[Dict[str, Any]]
     llm_results: List[OCRNormalizedResult]
     ai_results: List[OCRNormalizedResult]
     triangulation_rows: List[OCRTriangulationRow]
@@ -427,6 +432,176 @@ class AIAuditLog:
         )
 
 
+def _json_dumps_safe(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return json.dumps({"repr": repr(payload)}, ensure_ascii=False)
+
+
+def _sdk_response_to_dict(response: Any) -> Dict[str, Any]:
+    try:
+        if hasattr(response, "model_dump"):
+            return response.model_dump()
+        if hasattr(response, "model_dump_json"):
+            return json.loads(response.model_dump_json())
+    except Exception:
+        pass
+    try:
+        if hasattr(response, "to_dict"):
+            return response.to_dict()
+    except Exception:
+        pass
+    return {"repr": repr(response)}
+
+
+class OpenAIAuditDB:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self._init_schema()
+        self.run_id = ""
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+              run_id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS api_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              title TEXT NOT NULL,
+              model TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              cache_key TEXT,
+              was_cached INTEGER NOT NULL DEFAULT 0,
+              error TEXT NOT NULL DEFAULT '',
+              request_json TEXT NOT NULL,
+              response_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_events_stage_created ON api_events(stage, created_at);
+            CREATE INDEX IF NOT EXISTS idx_api_events_cache_key ON api_events(cache_key);
+            CREATE TABLE IF NOT EXISTS stage_cache (
+              stage TEXT NOT NULL,
+              cache_key TEXT NOT NULL,
+              model_class TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(stage, cache_key)
+            );
+            """
+            )
+            self.conn.commit()
+
+    def start_run(self, metadata: Dict[str, Any]) -> str:
+        run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO runs(run_id, created_at, metadata_json) VALUES (?, ?, ?)",
+                (run_id, time.strftime("%Y-%m-%d %H:%M:%S"), _json_dumps_safe(metadata)),
+            )
+            self.conn.commit()
+        self.run_id = run_id
+        return run_id
+
+    def log_event(
+        self,
+        stage: str,
+        title: str,
+        model: str,
+        prompt_version: str,
+        request: Dict[str, Any],
+        response: Optional[Dict[str, Any]] = None,
+        was_cached: bool = False,
+        error: str = "",
+        cache_key: str = "",
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO api_events(
+                  run_id, created_at, stage, title, model, prompt_version, cache_key, was_cached, error, request_json, response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.run_id or "unknown",
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    stage,
+                    title,
+                    model,
+                    prompt_version,
+                    cache_key,
+                    1 if was_cached else 0,
+                    error,
+                    _json_dumps_safe(request),
+                    _json_dumps_safe(response or {}),
+                ),
+            )
+            self.conn.commit()
+
+    def cache_get_model(self, stage: str, cache_key: str, model_cls: Any) -> Optional[BaseModel]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT payload_json FROM stage_cache WHERE stage=? AND cache_key=?",
+                (stage, cache_key),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row[0])
+            return model_cls.model_validate(payload) if hasattr(model_cls, "model_validate") else model_cls.parse_obj(payload)
+        except Exception as exc:
+            logging.warning("Ignoring invalid DB cache entry for %s/%s: %s", stage, cache_key, exc)
+            return None
+
+    def cache_put_model(
+        self,
+        stage: str,
+        cache_key: str,
+        model_obj: BaseModel,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO stage_cache(stage, cache_key, model_class, payload_json, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stage, cache_key) DO UPDATE SET
+                  model_class=excluded.model_class,
+                  payload_json=excluded.payload_json,
+                  metadata_json=excluded.metadata_json,
+                  created_at=excluded.created_at
+                """,
+                (
+                    stage,
+                    cache_key,
+                    model_obj.__class__.__name__,
+                    model_to_json(model_obj),
+                    _json_dumps_safe(metadata or {}),
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            with self._lock:
+                self.conn.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class MatchResult:
     source_name: str
@@ -467,6 +642,8 @@ def configure_logging(log_file: Path, verbose: bool) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=handlers,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
 
 
 def _candidate_image_roots(root: Path) -> List[Path]:
@@ -1915,8 +2092,8 @@ def system_prompt_ai_image_ocr() -> str:
 
 Read the screenshot directly. Extract meaningful visible GUI text objects in the screenshot language. Do not translate and do not invent text.
 
-Prioritize translatable UI content: labels, buttons, tabs, menu names, headers, and instruction text.
-De-prioritize or ignore: standalone values (times, distances, speeds, numeric counters), masked identifiers, background map/place labels, decorative/status artifacts, and purely symbolic strings.
+Prioritize translatable UI content: labels, buttons, tabs, menu names, headers, instruction text, and short visible warning/status messages that carry user-facing meaning.
+De-prioritize or ignore: standalone values (times, distances, speeds, numeric counters), masked identifiers, background map/place labels, decorative/status artifacts without user-facing meaning, and purely symbolic strings.
 
 Keep separate GUI objects separate, join wrapped visual lines only when they form one GUI object, split merged text when needed, ignore icons/time/signal/decorative graphics, and distinguish navigation map labels from actual GUI text. Mark uncertain readings with needs_review. Return data matching the provided schema."""
 
@@ -1924,7 +2101,15 @@ Keep separate GUI objects separate, join wrapped visual lines only when they for
 def system_prompt_gui_object_match(target_language: str) -> str:
     return f"""You are a bilingual GUI string alignment specialist for vehicle infotainment screenshots.
 
-Match English GUI objects to corresponding {target_language} GUI objects using semantic equivalence, not line position alone. Use GUI role, row group, screen area, and reading order as supporting evidence. Do not invent target text and do not translate the output yourself. Return unmatched or uncertain when a reliable counterpart is not present. Return data matching the provided schema."""
+Match English GUI objects to corresponding {target_language} GUI objects using semantic equivalence, not line position alone. Use GUI role, row group, screen area, and reading order as supporting evidence.
+
+Consistency rules for short UI labels:
+- Prefer one-to-one label alignment when plausible.
+- Do not merge two English labels into one target match unless the target visibly has only one combined label.
+- If target word order is reversed (for example, source labels like "Edit" and "Favourites" vs a target phrase containing equivalents in reverse order), align by lexical meaning and assign the most specific counterpart to each source label.
+- If one source label cannot be isolated with confidence, return that row as uncertain/unmatched rather than forcing a merged match.
+
+Do not invent target text and do not translate the output yourself. Return unmatched or uncertain when a reliable counterpart is not present. Return data matching the provided schema."""
 
 
 def ensure_openai_client(api_key: str) -> Any:
@@ -1957,10 +2142,12 @@ def call_openai_structured(
     timeout_sec: int,
     max_retries: int,
     audit: Optional[AIAuditLog] = None,
+    audit_db: Optional[OpenAIAuditDB] = None,
     audit_stage: str = "",
     audit_title: str = "",
     audit_prompt_version: str = "",
     audit_request: Optional[Dict[str, Any]] = None,
+    audit_cache_key: str = "",
 ) -> BaseModel:
     client = ensure_openai_client(api_key)
     last_error: Optional[Exception] = None
@@ -1969,7 +2156,18 @@ def call_openai_structured(
         "input": user_content,
         "schema": getattr(schema_model, "__name__", str(schema_model)),
     }
+    stage_label = (audit_stage or "OpenAI structured call").strip()
+    title_label = (audit_title or "").strip()
     for attempt in range(max_retries + 1):
+        t0 = time.perf_counter()
+        logging.info(
+            "OpenAI call start | stage=%s | title=%s | model=%s | attempt=%d/%d",
+            stage_label,
+            title_label,
+            model,
+            attempt + 1,
+            max_retries + 1,
+        )
         try:
             # SDK parse helper gives Pydantic validation where available.
             response = client.responses.parse(
@@ -1980,6 +2178,14 @@ def call_openai_structured(
                 timeout=timeout_sec,
             )
             parsed = parse_response_output_model(response, schema_model)
+            elapsed = time.perf_counter() - t0
+            logging.info(
+                "OpenAI call done  | stage=%s | title=%s | model=%s | elapsed=%.2fs",
+                stage_label,
+                title_label,
+                model,
+                elapsed,
+            )
             if audit is not None:
                 audit.add(
                     audit_stage,
@@ -1988,6 +2194,17 @@ def call_openai_structured(
                     audit_prompt_version,
                     request_for_audit,
                     response=model_to_dict(parsed),
+                )
+            if audit_db is not None:
+                audit_db.log_event(
+                    audit_stage,
+                    audit_title,
+                    model,
+                    audit_prompt_version,
+                    request_for_audit,
+                    response={"parsed": model_to_dict(parsed), "raw_response": _sdk_response_to_dict(response)},
+                    was_cached=False,
+                    cache_key=audit_cache_key,
                 )
             return parsed
         except TypeError:
@@ -2006,6 +2223,14 @@ def call_openai_structured(
                 },
             )
             parsed = parse_response_output_model(response, schema_model)
+            elapsed = time.perf_counter() - t0
+            logging.info(
+                "OpenAI call done  | stage=%s | title=%s | model=%s | elapsed=%.2fs",
+                stage_label,
+                title_label,
+                model,
+                elapsed,
+            )
             if audit is not None:
                 audit.add(
                     audit_stage,
@@ -2015,9 +2240,29 @@ def call_openai_structured(
                     request_for_audit,
                     response=model_to_dict(parsed),
                 )
+            if audit_db is not None:
+                audit_db.log_event(
+                    audit_stage,
+                    audit_title,
+                    model,
+                    audit_prompt_version,
+                    request_for_audit,
+                    response={"parsed": model_to_dict(parsed), "raw_response": _sdk_response_to_dict(response)},
+                    was_cached=False,
+                    cache_key=audit_cache_key,
+                )
             return parsed
         except Exception as exc:
             last_error = exc
+            elapsed = time.perf_counter() - t0
+            logging.warning(
+                "OpenAI call error | stage=%s | title=%s | model=%s | elapsed=%.2fs | error=%s",
+                stage_label,
+                title_label,
+                model,
+                elapsed,
+                exc,
+            )
             if attempt < max_retries:
                 time.sleep(min(2 ** attempt, 8))
     if audit is not None:
@@ -2028,6 +2273,18 @@ def call_openai_structured(
             audit_prompt_version,
             request_for_audit,
             error=str(last_error),
+        )
+    if audit_db is not None:
+        audit_db.log_event(
+            audit_stage,
+            audit_title,
+            model,
+            audit_prompt_version,
+            request_for_audit,
+            response=None,
+            was_cached=False,
+            error=str(last_error),
+            cache_key=audit_cache_key,
         )
     raise RuntimeError(f"OpenAI structured request failed after {max_retries + 1} attempt(s): {last_error}")
 
@@ -2044,12 +2301,41 @@ def normalize_ocr_with_llm(
     max_retries: int,
     cache_dir: Path,
     use_cache: bool,
+    audit_db: Optional[OpenAIAuditDB] = None,
+    restore_from_db_cache: bool = True,
+    write_to_db_cache: bool = True,
     audit: Optional[AIAuditLog] = None,
     pair_id: str = "",
 ) -> OCRNormalizedResult:
     package = ocr_candidates_package(image_filename, language_code, language_name, side, evidence)
     package_json = json.dumps(package, ensure_ascii=False, sort_keys=True)
     key = cache_key_for_payload(LLM_OCR_NORMALIZATION_PROMPT_VERSION, model, package_json)
+    if restore_from_db_cache and audit_db is not None:
+        cached_db = audit_db.cache_get_model("llm_ocr_normalization", key, OCRNormalizedResult)
+        if cached_db:
+            result = cached_db  # type: ignore[assignment]
+            result.cached = True
+            if audit is not None:
+                audit.add(
+                    "LLM OCR-normalization",
+                    f"{pair_id} {side} {image_filename}",
+                    model,
+                    LLM_OCR_NORMALIZATION_PROMPT_VERSION,
+                    {"cache_key": key, "cache_backend": "sqlite", "image_filename": image_filename, "language": language_code, "side": side},
+                    response=model_to_dict(result),
+                    cached=True,
+                )
+            audit_db.log_event(
+                "LLM OCR-normalization",
+                f"{pair_id} {side} {image_filename}",
+                model,
+                LLM_OCR_NORMALIZATION_PROMPT_VERSION,
+                {"cache_key": key, "cache_backend": "sqlite", "image_filename": image_filename, "language": language_code, "side": side},
+                response={"parsed": model_to_dict(result)},
+                was_cached=True,
+                cache_key=key,
+            )
+            return result
     if use_cache:
         cached = read_cached_model(cache_dir, key, OCRNormalizedResult)
         if cached:
@@ -2071,6 +2357,30 @@ def normalize_ocr_with_llm(
                     response=model_to_dict(result),
                     cached=True,
                 )
+            if audit_db is not None:
+                audit_db.log_event(
+                    "LLM OCR-normalization",
+                    f"{pair_id} {side} {image_filename}",
+                    model,
+                    LLM_OCR_NORMALIZATION_PROMPT_VERSION,
+                    {
+                        "cache_key": key,
+                        "cache_backend": "json_file",
+                        "image_filename": image_filename,
+                        "language": language_code,
+                        "side": side,
+                    },
+                    response={"parsed": model_to_dict(result)},
+                    was_cached=True,
+                    cache_key=key,
+                )
+                if write_to_db_cache:
+                    audit_db.cache_put_model(
+                        "llm_ocr_normalization",
+                        key,
+                        result,
+                        metadata={"model": model, "prompt_version": LLM_OCR_NORMALIZATION_PROMPT_VERSION, "side": side, "image_filename": image_filename},
+                    )
             return result
     user_text = (
         f"FILENAME: {image_filename}\n"
@@ -2100,10 +2410,12 @@ def normalize_ocr_with_llm(
         timeout_sec,
         max_retries,
         audit=audit,
+        audit_db=audit_db,
         audit_stage="LLM OCR-normalization",
         audit_title=f"{pair_id} {side} {image_filename}",
         audit_prompt_version=LLM_OCR_NORMALIZATION_PROMPT_VERSION,
         audit_request=audit_request,
+        audit_cache_key=key,
     )
     assert isinstance(result, OCRNormalizedResult)
     result.source_engine = "llm_ocr_normalization"
@@ -2112,6 +2424,13 @@ def normalize_ocr_with_llm(
     result.cached = False
     if use_cache:
         write_cached_model(cache_dir, key, result)
+    if write_to_db_cache and audit_db is not None:
+        audit_db.cache_put_model(
+            "llm_ocr_normalization",
+            key,
+            result,
+            metadata={"model": model, "prompt_version": LLM_OCR_NORMALIZATION_PROMPT_VERSION, "side": side, "image_filename": image_filename},
+        )
     return result
 
 
@@ -2134,11 +2453,41 @@ def ai_image_ocr(
     max_retries: int,
     cache_dir: Path,
     use_cache: bool,
+    cache_only: bool = False,
+    audit_db: Optional[OpenAIAuditDB] = None,
+    restore_from_db_cache: bool = True,
+    write_to_db_cache: bool = True,
     audit: Optional[AIAuditLog] = None,
     pair_id: str = "",
 ) -> OCRNormalizedResult:
     image_hash = file_sha256(rendered_png)
     key = cache_key_for_payload(AI_IMAGE_OCR_PROMPT_VERSION, model, detail, image_hash, image_filename, side, language_code)
+    if restore_from_db_cache and audit_db is not None:
+        cached_db = audit_db.cache_get_model("ai_image_ocr", key, OCRNormalizedResult)
+        if cached_db:
+            result = cached_db  # type: ignore[assignment]
+            result.cached = True
+            if audit is not None:
+                audit.add(
+                    "AI image OCR",
+                    f"{pair_id} {side} {image_filename}",
+                    model,
+                    AI_IMAGE_OCR_PROMPT_VERSION,
+                    {"cache_key": key, "cache_backend": "sqlite", "rendered_png": str(rendered_png), "image_hash": image_hash, "detail": detail},
+                    response=model_to_dict(result),
+                    cached=True,
+                )
+            audit_db.log_event(
+                "AI image OCR",
+                f"{pair_id} {side} {image_filename}",
+                model,
+                AI_IMAGE_OCR_PROMPT_VERSION,
+                {"cache_key": key, "cache_backend": "sqlite", "rendered_png": str(rendered_png), "image_hash": image_hash, "detail": detail},
+                response={"parsed": model_to_dict(result)},
+                was_cached=True,
+                cache_key=key,
+            )
+            return result
     if use_cache:
         cached = read_cached_model(cache_dir, key, OCRNormalizedResult)
         if cached:
@@ -2160,7 +2509,35 @@ def ai_image_ocr(
                     response=model_to_dict(result),
                     cached=True,
                 )
+            if audit_db is not None:
+                audit_db.log_event(
+                    "AI image OCR",
+                    f"{pair_id} {side} {image_filename}",
+                    model,
+                    AI_IMAGE_OCR_PROMPT_VERSION,
+                    {
+                        "cache_key": key,
+                        "cache_backend": "json_file",
+                        "rendered_png": str(rendered_png),
+                        "image_hash": image_hash,
+                        "detail": detail,
+                    },
+                    response={"parsed": model_to_dict(result)},
+                    was_cached=True,
+                    cache_key=key,
+                )
+                if write_to_db_cache:
+                    audit_db.cache_put_model(
+                        "ai_image_ocr",
+                        key,
+                        result,
+                        metadata={"model": model, "prompt_version": AI_IMAGE_OCR_PROMPT_VERSION, "side": side, "image_filename": image_filename, "image_hash": image_hash},
+                    )
             return result
+    if cache_only:
+        raise RuntimeError(
+            f"AI OCR cache miss for {image_filename} ({side}); cache-only mode will not call OpenAI."
+        )
     user_text = (
         f"FILENAME: {image_filename}\n"
         f"LANGUAGE CODE: {language_code}\n"
@@ -2193,10 +2570,12 @@ def ai_image_ocr(
         timeout_sec,
         max_retries,
         audit=audit,
+        audit_db=audit_db,
         audit_stage="AI image OCR",
         audit_title=f"{pair_id} {side} {image_filename}",
         audit_prompt_version=AI_IMAGE_OCR_PROMPT_VERSION,
         audit_request=audit_request,
+        audit_cache_key=key,
     )
     assert isinstance(result, OCRNormalizedResult)
     result.source_engine = "ai_image_ocr"
@@ -2206,6 +2585,13 @@ def ai_image_ocr(
     result.cached = False
     if use_cache:
         write_cached_model(cache_dir, key, result)
+    if write_to_db_cache and audit_db is not None:
+        audit_db.cache_put_model(
+            "ai_image_ocr",
+            key,
+            result,
+            metadata={"model": model, "prompt_version": AI_IMAGE_OCR_PROMPT_VERSION, "side": side, "image_filename": image_filename, "image_hash": image_hash},
+        )
     return result
 
 
@@ -2273,6 +2659,26 @@ def is_value_only_text(text: str) -> bool:
     return False
 
 
+def is_short_translatable_status_text(raw_text: str, obj: Optional[NormalizedGUIObject] = None) -> bool:
+    text = clean_line(raw_text)
+    if not text or is_value_only_text(text) or re.search(r"\d", text):
+        return False
+    tokens = [t for t in text.split() if t]
+    if len(tokens) > 3:
+        return False
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 2 or len(letters) > 24:
+        return False
+    has_warning_punctuation = bool(re.search(r"[!?]", raw_text))
+    mostly_upper = not any(ch.islower() for ch in letters)
+    if has_warning_punctuation:
+        return True
+    if obj is None:
+        return False
+    confidence = max(float(obj.ocr_evidence_confidence), float(obj.normalization_confidence))
+    return bool(obj.is_translatable_gui_string and obj.gui_role == "status_bar" and mostly_upper and confidence >= 0.75)
+
+
 def classify_object_lane(obj: NormalizedGUIObject) -> str:
     raw_text = "" if obj.normalized_text is None else str(obj.normalized_text)
     text = clean_line(raw_text)
@@ -2285,6 +2691,8 @@ def classify_object_lane(obj: NormalizedGUIObject) -> str:
     if obj.gui_role in {"map_label"}:
         return "map_background"
     if obj.gui_role in {"status_bar"}:
+        if is_short_translatable_status_text(raw_text, obj):
+            return "translatable_gui"
         return "decorative_status"
     if is_value_only_text(text):
         return "value_only"
@@ -2297,6 +2705,139 @@ def classify_object_lane(obj: NormalizedGUIObject) -> str:
     return "unknown_review"
 
 
+def is_label_like_value_text(text: str) -> bool:
+    s = clean_line(text)
+    if not s:
+        return False
+    if is_short_translatable_status_text(text):
+        return True
+    if is_value_only_text(s):
+        return False
+    if re.search(r"\d", s):
+        return False
+    tokens = [t for t in s.split() if t]
+    if not tokens:
+        return False
+    if len(tokens) > 4:
+        return False
+    letters = sum(ch.isalpha() for ch in s)
+    if letters < 4:
+        return False
+    return True
+
+
+def extract_label_candidates(text: str) -> List[str]:
+    s = clean_line(text)
+    if not s:
+        return []
+    out: List[str] = [s]
+    stripped = re.sub(r"^[*xX•._\- ]+", "", s).strip()
+    if stripped and stripped != s:
+        out.append(stripped)
+    dedup: List[str] = []
+    seen = set()
+    for item in out:
+        norm = normalize_for_llm_guard(item).lower()
+        if not norm or norm in seen:
+            continue
+        if is_label_like_value_text(item):
+            dedup.append(item)
+            seen.add(norm)
+    return dedup
+
+
+def normalize_text_key(text: str) -> str:
+    return remove_accents(clean_line(normalize_for_llm_guard(text))).lower()
+
+
+def read_om_english_strings(om_xlsx: Path) -> List[str]:
+    strings: List[str] = []
+    if not om_xlsx.exists():
+        return strings
+    try:
+        xls = pd.ExcelFile(om_xlsx)
+    except Exception as exc:
+        logging.warning("Failed to open OM strings workbook %s: %s", om_xlsx, exc)
+        return strings
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(om_xlsx, sheet_name=sheet)
+        except Exception as exc:
+            logging.warning("Failed reading OM sheet %s: %s", sheet, exc)
+            continue
+        if df.empty:
+            continue
+        cols = [str(c).strip() for c in df.columns]
+        lower_cols = [c.lower() for c in cols]
+        en_col_idx = -1
+        for i, c in enumerate(lower_cols):
+            if c in {"en", "english", "source", "source_en", "om_en"}:
+                en_col_idx = i
+                break
+        if en_col_idx < 0:
+            for i, c in enumerate(lower_cols):
+                if "en" in c or "english" in c:
+                    en_col_idx = i
+                    break
+        if en_col_idx < 0:
+            en_col_idx = 0
+        col = cols[en_col_idx]
+        for val in df[col].tolist():
+            s = normalize_for_llm_guard("" if val is None else str(val))
+            if s:
+                strings.append(s)
+    dedup: List[str] = []
+    seen = set()
+    for s in strings:
+        key = normalize_text_key(s)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup.append(s)
+    return dedup
+
+
+def build_om_strings_rows(report: "PipelineReport", om_xlsx: Path) -> List[Dict[str, Any]]:
+    om_strings = read_om_english_strings(om_xlsx)
+    if not om_strings:
+        return []
+
+    by_source: Dict[str, List[GUIMatch]] = {}
+    for m in report.final_matches:
+        key = normalize_text_key(m.source_text)
+        if not key:
+            continue
+        by_source.setdefault(key, []).append(m)
+
+    rows: List[Dict[str, Any]] = []
+    for s in om_strings:
+        key = normalize_text_key(s)
+        hits = by_source.get(key, [])
+        matched_hits = [m for m in hits if normalize_for_llm_guard(m.target_text)]
+        targets: List[str] = []
+        for m in matched_hits:
+            t = normalize_for_llm_guard(m.target_text)
+            if t and t not in targets:
+                targets.append(t)
+        best_status = "not_found"
+        best_conf = 0.0
+        if hits:
+            best = max(hits, key=lambda m: (m.overall_confidence, m.semantic_confidence))
+            best_status = best.status
+            best_conf = best.overall_confidence
+        rows.append(
+            {
+                "om_en_string": s,
+                "target_equivalent_candidates": " | ".join(targets),
+                "matched_in_final_matches": bool(hits),
+                "best_match_status": best_status,
+                "best_match_confidence": round(best_conf, 3),
+                "match_count": len(hits),
+            }
+        )
+    return rows
+
+
 def corroborate_with_raw_ocr(text: str, classic: ClassicOCRResult) -> Tuple[str, str]:
     candidate = normalize_for_llm_guard(text)
     if not candidate:
@@ -2307,10 +2848,14 @@ def corroborate_with_raw_ocr(text: str, classic: ClassicOCRResult) -> Tuple[str,
     if any(candidate in block for block in raw_blocks):
         return "confirmed", "Exact normalized substring found in raw OCR full text."
     cand_norm = remove_accents(candidate).lower()
+    cand_clean = remove_accents(clean_line(candidate)).lower()
     for block in raw_blocks:
         block_norm = remove_accents(block).lower()
         if cand_norm and cand_norm in block_norm:
             return "weakly_confirmed", "Accent-insensitive substring found in raw OCR full text."
+        block_clean = remove_accents(clean_line(block)).lower()
+        if cand_clean and len(cand_clean) >= 2 and cand_clean in block_clean:
+            return "weakly_confirmed", "Punctuation-insensitive substring found in raw OCR full text."
         ratio = difflib.SequenceMatcher(None, cand_norm, block_norm).ratio() if cand_norm and block_norm else 0.0
         if ratio >= 0.88:
             return "weakly_confirmed", f"High fuzzy similarity against raw OCR full text ({ratio:.2f})."
@@ -2597,9 +3142,45 @@ def semantic_quality_check(
     api_key: str,
     timeout_sec: int,
     max_retries: int,
+    audit: Optional[AIAuditLog] = None,
+    audit_db: Optional[OpenAIAuditDB] = None,
+    restore_from_db_cache: bool = True,
+    write_to_db_cache: bool = True,
+    pair_id: str = "",
 ) -> SemanticPairCheck:
     if not source_text or not target_text:
         return SemanticPairCheck(semantic_check_status="warning", semantic_check_confidence=0.0, semantic_check_reason="Missing source or target text.")
+    # Fast-pass for exact/cognate-like matches to avoid unnecessary mismatch calls.
+    src_norm = remove_accents(normalize_for_llm_guard(source_text)).lower()
+    tgt_norm = remove_accents(normalize_for_llm_guard(target_text)).lower()
+    sim = difflib.SequenceMatcher(None, src_norm, tgt_norm).ratio() if src_norm and tgt_norm else 0.0
+    if src_norm == tgt_norm or sim >= 0.88:
+        return SemanticPairCheck(
+            semantic_check_status="ok",
+            semantic_check_confidence=max(0.90, min(0.99, sim)),
+            semantic_check_reason="Fast-pass: exact/near-cognate lexical match.",
+        )
+    cache_key = cache_key_for_payload(
+        "semantic_pair_check_v1",
+        model,
+        target_language_name,
+        normalize_for_llm_guard(source_text),
+        normalize_for_llm_guard(target_text),
+    )
+    if restore_from_db_cache and audit_db is not None:
+        cached = audit_db.cache_get_model("semantic_pair_check", cache_key, SemanticPairCheck)
+        if cached:
+            audit_db.log_event(
+                "Semantic pair quality check",
+                f"{pair_id} semantic check: {source_text[:40]} -> {target_text[:40]}",
+                model,
+                "semantic_pair_check_v1",
+                {"pair_id": pair_id, "source_text": source_text, "target_text": target_text, "target_language_name": target_language_name},
+                response={"parsed": model_to_dict(cached)},
+                was_cached=True,
+                cache_key=cache_key,
+            )
+            return cached  # type: ignore[return-value]
     schema = SemanticPairCheck
     user_text = (
         f"SOURCE_TEXT: {source_text}\n"
@@ -2616,8 +3197,27 @@ def semantic_quality_check(
         schema_model=schema,
         timeout_sec=timeout_sec,
         max_retries=max_retries,
+        audit=audit,
+        audit_db=audit_db,
+        audit_stage="Semantic pair quality check",
+        audit_title=f"{pair_id} semantic check: {source_text[:40]} -> {target_text[:40]}",
+        audit_prompt_version="semantic_pair_check_v1",
+        audit_request={
+            "pair_id": pair_id,
+            "source_text": source_text,
+            "target_text": target_text,
+            "target_language_name": target_language_name,
+        },
+        audit_cache_key=cache_key,
     )
     assert isinstance(parsed, SemanticPairCheck)
+    if write_to_db_cache and audit_db is not None:
+        audit_db.cache_put_model(
+            "semantic_pair_check",
+            cache_key,
+            parsed,
+            metadata={"pair_id": pair_id, "target_language_name": target_language_name, "model": model},
+        )
     return parsed
 
 
@@ -2639,12 +3239,107 @@ def enforce_one_to_one_target_assignment(matches: List[GUIMatch]) -> None:
                 matches[i].review_reason = (matches[i].review_reason + " | target object reused").strip(" |")
 
 
+def enforce_one_to_one_source_assignment(matches: List[GUIMatch]) -> None:
+    used: Dict[str, List[int]] = {}
+    for i, m in enumerate(matches):
+        used.setdefault(m.source_object_id, []).append(i)
+    for source_id, idxs in used.items():
+        if len(idxs) <= 1:
+            continue
+        best = max(idxs, key=lambda i: (matches[i].overall_confidence, matches[i].semantic_confidence))
+        for i in idxs:
+            if i == best:
+                continue
+            matches[i].status = "unmatched"
+            matches[i].target_object_id = None
+            matches[i].target_text = ""
+            matches[i].match_type = "unmatched"
+            matches[i].review_reason = (matches[i].review_reason + " | duplicate source match dropped").strip(" |")
+
+
 def apply_final_quality_gates(match: GUIMatch) -> None:
     if match.status == "matched" and (
         match.semantic_check_status == "mismatch" or match.raw_ocr_validation_status == "not_confirmed"
     ):
         match.status = "needs_review"
         match.review_reason = (match.review_reason + " | blocked by semantic/raw-evidence gate").strip(" |")
+
+
+def _status_rank(status: str) -> int:
+    return {"matched": 4, "needs_review": 3, "uncertain": 2, "unmatched": 1}.get(status, 0)
+
+
+def dedupe_equivalent_matches(matches: List[GUIMatch]) -> List[GUIMatch]:
+    best_by_key: Dict[Tuple[str, str], GUIMatch] = {}
+    for m in matches:
+        key = (
+            normalize_for_llm_guard(m.source_text).lower(),
+            normalize_for_llm_guard(m.target_text).lower(),
+        )
+        existing = best_by_key.get(key)
+        if existing is None:
+            best_by_key[key] = m
+            continue
+        lhs = (_status_rank(m.status), m.overall_confidence, m.semantic_confidence)
+        rhs = (_status_rank(existing.status), existing.overall_confidence, existing.semantic_confidence)
+        if lhs > rhs:
+            best_by_key[key] = m
+    return list(best_by_key.values())
+
+
+def collapse_duplicate_source_text(matches: List[GUIMatch]) -> List[GUIMatch]:
+    best_by_source: Dict[str, GUIMatch] = {}
+    for m in matches:
+        key = normalize_for_llm_guard(m.source_text).lower()
+        if not key:
+            continue
+        existing = best_by_source.get(key)
+        if existing is None:
+            best_by_source[key] = m
+            continue
+        lhs = (_status_rank(m.status), m.overall_confidence, -len(normalize_for_llm_guard(m.target_text)))
+        rhs = (_status_rank(existing.status), existing.overall_confidence, -len(normalize_for_llm_guard(existing.target_text)))
+        if lhs > rhs:
+            best_by_source[key] = m
+    selected_ids = {id(v) for v in best_by_source.values()}
+    passthrough = [m for m in matches if not normalize_for_llm_guard(m.source_text)]
+    return [m for m in matches if id(m) in selected_ids] + passthrough
+
+
+def is_icon_inference_candidate(obj: NormalizedGUIObject, classic: ClassicOCRResult) -> bool:
+    text = clean_line(obj.normalized_text)
+    if not text:
+        return False
+    corroboration, _ = corroborate_with_raw_ocr(text, classic)
+    if corroboration != "not_confirmed":
+        return False
+    rationale_blob = " ".join(
+        [
+            normalize_for_llm_guard(obj.rationale).lower(),
+            normalize_for_llm_guard(obj.raw_visual_evidence).lower(),
+            " ".join(normalize_for_llm_guard(x).lower() for x in obj.raw_evidence),
+            normalize_for_llm_guard(obj.object_id).lower(),
+        ]
+    )
+    icon_markers = ("icon", "symbol", "arrow", "glyph", "nav_category_button")
+    if not any(m in rationale_blob for m in icon_markers):
+        return False
+    token_count = len([t for t in text.split() if t])
+    return token_count <= 4
+
+
+def _ensure_unique_object_ids(objects: Sequence[NormalizedGUIObject], prefix: str) -> List[NormalizedGUIObject]:
+    out: List[NormalizedGUIObject] = []
+    seen: Dict[str, int] = {}
+    for i, obj in enumerate(objects, start=1):
+        base = normalize_for_llm_guard(obj.object_id) or f"{prefix}_{i:03d}"
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        new_id = base if count == 1 else f"{base}__dup{count}"
+        clone = obj.model_copy(deep=True)
+        clone.object_id = new_id
+        out.append(clone)
+    return out
 
 
 def ai_validated_matches(
@@ -2660,15 +3355,41 @@ def ai_validated_matches(
     api_key: Optional[str],
     timeout_sec: int,
     max_retries: int,
+    audit: Optional[AIAuditLog] = None,
+    audit_db: Optional[OpenAIAuditDB] = None,
+    restore_object_match_from_db_cache: bool = True,
+    write_object_match_to_db_cache: bool = True,
+    restore_semantic_check_from_db_cache: bool = True,
+    write_semantic_check_to_db_cache: bool = True,
+    parallel_workers: int = 1,
 ) -> List[GUIMatch]:
-    source_all = source_ai.ui_objects
-    target_all = target_ai.ui_objects
+    source_all = _ensure_unique_object_ids(source_ai.ui_objects, "src")
+    target_all = _ensure_unique_object_ids(target_ai.ui_objects, "tgt")
     source_lane = {o.object_id: classify_object_lane(o) for o in source_all}
     target_lane = {o.object_id: classify_object_lane(o) for o in target_all}
 
-    # Only translatable-gui lane objects participate in normal semantic matching.
-    source_objects = [o for o in source_all if source_lane.get(o.object_id) == "translatable_gui"]
-    target_objects = [o for o in target_all if target_lane.get(o.object_id) == "translatable_gui"]
+    def _expand_objects(
+        objects: Sequence[NormalizedGUIObject],
+        lane_map: Dict[str, str],
+        classic: ClassicOCRResult,
+    ) -> List[NormalizedGUIObject]:
+        expanded: List[NormalizedGUIObject] = []
+        for obj in objects:
+            lane = lane_map.get(obj.object_id, "unknown_review")
+            if lane != "translatable_gui":
+                continue
+            if is_icon_inference_candidate(obj, classic):
+                continue
+            # Text-only rule: keep only OCR-corroborated GUI text objects.
+            corroboration, _ = corroborate_with_raw_ocr(obj.normalized_text, classic)
+            if corroboration == "not_confirmed":
+                continue
+            expanded.append(obj)
+        return expanded
+
+    # Primary lane is translatable_gui; plus promoted label-like candidates from non-translatable lanes.
+    source_objects = _expand_objects(source_all, source_lane, source_classic)
+    target_objects = _expand_objects(target_all, target_lane, target_classic)
 
     if not source_objects:
         return []
@@ -2681,26 +3402,78 @@ def ai_validated_matches(
         item["object_lane"] = target_lane.get(item["object_id"], "unknown_review")
 
     if api_key:
-        user_text = (
-            f"PAIR ID: {pair_id}\n"
-            f"SOURCE IMAGE: {source_image}\n"
-            f"TARGET IMAGE: {target_image}\n"
-            f"TARGET LANGUAGE NAME: {target_language_name}\n\n"
-            f"SOURCE_OBJECTS: {json.dumps(source_objs_dict, ensure_ascii=False)}\n\n"
-            f"TARGET_OBJECTS: {json.dumps(target_objs_dict, ensure_ascii=False)}\n\n"
-            "Match only translatable GUI content. Do not prioritize value-only, masked, map background, or decorative/status lanes."
-        )
-        result = call_openai_structured(
-            api_key,
+        object_match_cache_key = cache_key_for_payload(
+            "ai_validated_object_match_v1",
             model,
-            system_prompt=system_prompt_gui_object_match(target_language_name),
-            user_content=[{"type": "input_text", "text": user_text}],
-            schema_model=GUIObjectMatchResponse,
-            timeout_sec=timeout_sec,
-            max_retries=max_retries,
+            pair_id,
+            json.dumps(source_objs_dict, ensure_ascii=False, sort_keys=True),
+            json.dumps(target_objs_dict, ensure_ascii=False, sort_keys=True),
         )
-        assert isinstance(result, GUIObjectMatchResponse)
-        matches = validate_gui_matches(result, source_objects, target_objects)
+        cached_object_match: Optional[GUIObjectMatchResponse] = None
+        if restore_object_match_from_db_cache and audit_db is not None:
+            cached_object_match = audit_db.cache_get_model("ai_validated_object_match", object_match_cache_key, GUIObjectMatchResponse)  # type: ignore[assignment]
+        if cached_object_match is not None:
+            result = cached_object_match
+            audit_db.log_event(
+                "AI-validated object matching",
+                f"{pair_id} {source_image} -> {target_image}",
+                model,
+                GUI_OBJECT_MATCH_PROMPT_VERSION + "_ai_validated",
+                {
+                    "pair_id": pair_id,
+                    "source_image": source_image,
+                    "target_image": target_image,
+                    "source_objects": source_objs_dict,
+                    "target_objects": target_objs_dict,
+                },
+                response={"parsed": model_to_dict(result)},
+                was_cached=True,
+                cache_key=object_match_cache_key,
+            )
+            matches = validate_gui_matches(result, source_objects, target_objects)
+        else:
+            user_text = (
+                f"PAIR ID: {pair_id}\n"
+                f"SOURCE IMAGE: {source_image}\n"
+                f"TARGET IMAGE: {target_image}\n"
+                f"TARGET LANGUAGE NAME: {target_language_name}\n\n"
+                f"SOURCE_OBJECTS: {json.dumps(source_objs_dict, ensure_ascii=False)}\n\n"
+                f"TARGET_OBJECTS: {json.dumps(target_objs_dict, ensure_ascii=False)}\n\n"
+                "Match only translatable GUI content. Do not prioritize value-only, masked, map background, or decorative/status lanes.\n"
+                "For short labels, prefer one-to-one mapping and avoid merged target assignments unless unavoidable.\n"
+                "If target phrase appears to combine multiple labels, map each source label to the best lexical counterpart (including reversed order) or mark uncertain/unmatched."
+            )
+            result = call_openai_structured(
+                api_key,
+                model,
+                system_prompt=system_prompt_gui_object_match(target_language_name),
+                user_content=[{"type": "input_text", "text": user_text}],
+                schema_model=GUIObjectMatchResponse,
+                timeout_sec=timeout_sec,
+                max_retries=max_retries,
+                audit=audit,
+                audit_db=audit_db,
+                audit_stage="AI-validated object matching",
+                audit_title=f"{pair_id} {source_image} -> {target_image}",
+                audit_prompt_version=GUI_OBJECT_MATCH_PROMPT_VERSION + "_ai_validated",
+                audit_request={
+                    "pair_id": pair_id,
+                    "source_image": source_image,
+                    "target_image": target_image,
+                    "source_objects": source_objs_dict,
+                    "target_objects": target_objs_dict,
+                },
+                audit_cache_key=object_match_cache_key,
+            )
+            assert isinstance(result, GUIObjectMatchResponse)
+            if write_object_match_to_db_cache and audit_db is not None:
+                audit_db.cache_put_model(
+                    "ai_validated_object_match",
+                    object_match_cache_key,
+                    result,
+                    metadata={"pair_id": pair_id, "model": model, "target_language_name": target_language_name},
+                )
+            matches = validate_gui_matches(result, source_objects, target_objects)
     else:
         # deterministic fallback
         matches = []
@@ -2728,20 +3501,143 @@ def ai_validated_matches(
                 )
             )
 
+    # Recovery pass: if first pass omitted source objects, ask LLM to match remaining source/target objects.
+    if api_key:
+        matched_source_ids = {m.source_object_id for m in matches}
+        matched_target_ids = {m.target_object_id for m in matches if m.target_object_id}
+        remaining_source = [o for o in source_objects if o.object_id not in matched_source_ids]
+        remaining_target = [o for o in target_objects if o.object_id not in matched_target_ids]
+        if remaining_source and remaining_target:
+            rem_source_dict = [model_to_dict(o) for o in remaining_source]
+            rem_target_dict = [model_to_dict(o) for o in remaining_target]
+            rem_user_text = (
+                f"PAIR ID: {pair_id}\n"
+                f"SOURCE IMAGE: {source_image}\n"
+                f"TARGET IMAGE: {target_image}\n"
+                f"TARGET LANGUAGE NAME: {target_language_name}\n\n"
+                f"REMAINING_SOURCE_OBJECTS: {json.dumps(rem_source_dict, ensure_ascii=False)}\n\n"
+                f"REMAINING_TARGET_OBJECTS: {json.dumps(rem_target_dict, ensure_ascii=False)}\n\n"
+                "Match the remaining source GUI objects to remaining target GUI objects. "
+                "Prefer one-to-one short-label mapping, even when target word order is reversed. "
+                "If unsure, return uncertain or unmatched. Do not invent text."
+            )
+            try:
+                rem_cache_key = cache_key_for_payload(
+                    "ai_validated_object_match_recovery_v1",
+                    model,
+                    pair_id,
+                    json.dumps(rem_source_dict, ensure_ascii=False, sort_keys=True),
+                    json.dumps(rem_target_dict, ensure_ascii=False, sort_keys=True),
+                )
+                cached_rem: Optional[GUIObjectMatchResponse] = None
+                if restore_object_match_from_db_cache and audit_db is not None:
+                    cached_rem = audit_db.cache_get_model("ai_validated_object_match_recovery", rem_cache_key, GUIObjectMatchResponse)  # type: ignore[assignment]
+                if cached_rem is not None:
+                    rem_result = cached_rem
+                    audit_db.log_event(
+                        "AI-validated object matching (recovery pass)",
+                        f"{pair_id} {source_image} -> {target_image} (remaining)",
+                        model,
+                        GUI_OBJECT_MATCH_PROMPT_VERSION + "_ai_validated_recovery",
+                        {
+                            "pair_id": pair_id,
+                            "source_image": source_image,
+                            "target_image": target_image,
+                            "remaining_source_objects": rem_source_dict,
+                            "remaining_target_objects": rem_target_dict,
+                        },
+                        response={"parsed": model_to_dict(rem_result)},
+                        was_cached=True,
+                        cache_key=rem_cache_key,
+                    )
+                else:
+                    rem_result = call_openai_structured(
+                        api_key,
+                        model,
+                        system_prompt=system_prompt_gui_object_match(target_language_name),
+                        user_content=[{"type": "input_text", "text": rem_user_text}],
+                        schema_model=GUIObjectMatchResponse,
+                        timeout_sec=timeout_sec,
+                        max_retries=max_retries,
+                        audit=audit,
+                        audit_db=audit_db,
+                        audit_stage="AI-validated object matching (recovery pass)",
+                        audit_title=f"{pair_id} {source_image} -> {target_image} (remaining)",
+                        audit_prompt_version=GUI_OBJECT_MATCH_PROMPT_VERSION + "_ai_validated_recovery",
+                        audit_request={
+                            "pair_id": pair_id,
+                            "source_image": source_image,
+                            "target_image": target_image,
+                            "remaining_source_objects": rem_source_dict,
+                            "remaining_target_objects": rem_target_dict,
+                        },
+                        audit_cache_key=rem_cache_key,
+                    )
+                    if write_object_match_to_db_cache and audit_db is not None:
+                        audit_db.cache_put_model(
+                            "ai_validated_object_match_recovery",
+                            rem_cache_key,
+                            rem_result,  # type: ignore[arg-type]
+                            metadata={"pair_id": pair_id, "model": model, "target_language_name": target_language_name},
+                        )
+                assert isinstance(rem_result, GUIObjectMatchResponse)
+                rem_matches = validate_gui_matches(rem_result, remaining_source, remaining_target)
+                matches.extend(rem_matches)
+            except Exception:
+                logging.exception("AI-validated recovery matching failed for pair %s", pair_id)
+
     source_by_id = {o.object_id: o for o in source_all}
+    source_by_id.update({o.object_id: o for o in source_objects})
     target_by_id = {o.object_id: o for o in target_all}
+    target_by_id.update({o.object_id: o for o in target_objects})
+    # Fallback: pair still-unmatched source and target objects by reading order to avoid silent drops.
+    matched_source_ids = {m.source_object_id for m in matches if m.status != "unmatched"}
+    matched_target_ids = {m.target_object_id for m in matches if m.target_object_id and m.status != "unmatched"}
+    remaining_source = [o for o in source_objects if o.object_id not in matched_source_ids and is_label_like_value_text(o.normalized_text)]
+    remaining_target = [o for o in target_objects if o.object_id not in matched_target_ids and is_label_like_value_text(o.normalized_text)]
+    remaining_source.sort(key=lambda o: (o.row_group, o.reading_order, o.object_id))
+    remaining_target.sort(key=lambda o: (o.row_group, o.reading_order, o.object_id))
+    for src_obj, tgt_obj in zip(remaining_source, remaining_target):
+        matches.append(
+            GUIMatch(
+                pair_id=pair_id,
+                source_image_filename=source_image,
+                target_image_filename=target_image,
+                source_object_id=src_obj.object_id,
+                target_object_id=tgt_obj.object_id,
+                source_text=src_obj.normalized_text,
+                target_text=tgt_obj.normalized_text,
+                match_type="uncertain",
+                semantic_confidence=0.45,
+                layout_confidence=0.65,
+                overall_confidence=0.55,
+                status="needs_review",
+                rationale="Reading-order fallback pairing for unmatched residual objects.",
+                review_reason="fallback_residual_pairing",
+            )
+        )
+
+    # Normalize identity fields to the current pair context regardless of model payload values.
     for m in matches:
+        m.pair_id = pair_id
+        m.source_image_filename = source_image
+        m.target_image_filename = target_image
+
+    semantic_jobs: List[Tuple[int, str, str]] = []
+    for idx, m in enumerate(matches):
         source_obj = source_by_id.get(m.source_object_id)
         target_obj = target_by_id.get(m.target_object_id or "")
         if source_obj:
             m.source_object_lane = classify_object_lane(source_obj)
         if target_obj:
             m.target_object_lane = classify_object_lane(target_obj)
-        if m.source_object_lane != "translatable_gui":
+        promoted_source = "__" in (m.source_object_id or "")
+        promoted_target = "__" in (m.target_object_id or "")
+        if m.source_object_lane != "translatable_gui" and not promoted_source:
             if m.status != "unmatched":
                 m.status = "needs_review"
                 m.review_reason = (m.review_reason + f" | source lane={m.source_object_lane}").strip(" |")
-        if m.target_object_lane and m.target_object_lane != "translatable_gui" and m.status == "matched":
+        if m.target_object_lane and m.target_object_lane != "translatable_gui" and m.status == "matched" and not promoted_target:
             m.status = "needs_review"
             m.review_reason = (m.review_reason + f" | target lane={m.target_object_lane}").strip(" |")
 
@@ -2750,25 +3646,62 @@ def ai_validated_matches(
         m.raw_ocr_validation_reason = raw_reason
 
         if api_key and m.status != "unmatched":
-            try:
-                sem = semantic_quality_check(
-                    source_text=m.source_text,
-                    target_text=m.target_text,
-                    target_language_name=target_language_name,
-                    model=model,
-                    api_key=api_key,
-                    timeout_sec=timeout_sec,
-                    max_retries=max_retries,
-                )
-                m.semantic_check_status = sem.semantic_check_status
-                m.semantic_check_confidence = sem.semantic_check_confidence
-                m.semantic_check_reason = sem.semantic_check_reason
-            except Exception as exc:
-                m.semantic_check_status = "warning"
-                m.semantic_check_reason = f"Semantic check failed: {exc}"
+            semantic_jobs.append((idx, m.source_text, m.target_text))
         else:
             m.semantic_check_status = "warning"
             m.semantic_check_reason = "Semantic check unavailable (no API key or unmatched row)."
+
+    if semantic_jobs:
+        def _run_semantic(job: Tuple[int, str, str]) -> Tuple[int, Optional[SemanticPairCheck], str]:
+            idx, src_text, tgt_text = job
+            try:
+                sem = semantic_quality_check(
+                    source_text=src_text,
+                    target_text=tgt_text,
+                    target_language_name=target_language_name,
+                    model=model,
+                    api_key=api_key or "",
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                    audit=audit,
+                    audit_db=audit_db,
+                    restore_from_db_cache=restore_semantic_check_from_db_cache,
+                    write_to_db_cache=write_semantic_check_to_db_cache,
+                    pair_id=pair_id,
+                )
+                return idx, sem, ""
+            except Exception as exc:
+                return idx, None, str(exc)
+
+        if parallel_workers > 1 and len(semantic_jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(parallel_workers, len(semantic_jobs), 6)) as ex:
+                semantic_results = list(ex.map(_run_semantic, semantic_jobs))
+        else:
+            semantic_results = [_run_semantic(job) for job in semantic_jobs]
+
+        for idx, sem, err in semantic_results:
+            m = matches[idx]
+            if sem is None:
+                m.semantic_check_status = "warning"
+                m.semantic_check_reason = f"Semantic check failed: {err}"
+                continue
+            m.semantic_check_status = sem.semantic_check_status
+            m.semantic_check_confidence = sem.semantic_check_confidence
+            m.semantic_check_reason = sem.semantic_check_reason
+            if (
+                m.semantic_check_status == "mismatch"
+                and m.raw_ocr_validation_status in {"confirmed", "weakly_confirmed"}
+                and m.semantic_confidence >= 0.95
+                and m.layout_confidence >= 0.90
+                and m.source_object_lane == "translatable_gui"
+                and m.target_object_lane == "translatable_gui"
+            ):
+                m.semantic_check_status = "warning"
+                m.semantic_check_reason = (
+                    m.semantic_check_reason + " | downgraded from mismatch by high-confidence/confirmed heuristic"
+                ).strip(" |")
+
+    for m in matches:
 
         # Source-guided conflict (review-only, no overwrite)
         source_raw_status, _source_raw_reason = corroborate_with_raw_ocr(m.source_text, source_classic)
@@ -2777,6 +3710,12 @@ def ai_validated_matches(
             and m.semantic_check_status == "mismatch"
             and m.raw_ocr_validation_status in {"weakly_confirmed", "not_confirmed"}
             and source_raw_status in {"confirmed", "weakly_confirmed"}
+            and not (
+                m.semantic_confidence >= 0.95
+                and m.layout_confidence >= 0.90
+                and m.source_object_lane == "translatable_gui"
+                and m.target_object_lane == "translatable_gui"
+            )
         ):
             m.source_guided_conflict = True
             m.suggested_target_candidate = ""
@@ -2789,8 +3728,42 @@ def ai_validated_matches(
         else:
             m.suggested_target_candidate = str(m.suggested_target_candidate or "").strip()
 
+    # Guarantee source coverage: any source object not returned by matching is emitted as unmatched.
+    existing_source_ids = {m.source_object_id for m in matches}
+    for src_obj in source_objects:
+        if src_obj.object_id in existing_source_ids:
+            continue
+        matches.append(
+            GUIMatch(
+                pair_id=pair_id,
+                source_image_filename=source_image,
+                target_image_filename=target_image,
+                source_object_id=src_obj.object_id,
+                target_object_id=None,
+                source_text=src_obj.normalized_text,
+                target_text="",
+                match_type="unmatched",
+                semantic_confidence=0.0,
+                layout_confidence=0.0,
+                overall_confidence=0.0,
+                status="unmatched",
+                rationale="Source object not returned by object matcher.",
+                review_reason="coverage_backfill",
+                source_object_lane=classify_object_lane(src_obj),
+                target_object_lane="",
+                raw_ocr_validation_status="not_confirmed",
+                raw_ocr_validation_reason="No target candidate selected.",
+                semantic_check_status="warning",
+                semantic_check_confidence=0.0,
+                semantic_check_reason="No target candidate selected.",
+                source_guided_conflict=False,
+                suggested_target_candidate="",
+            )
+        )
+
+    enforce_one_to_one_source_assignment(matches)
     enforce_one_to_one_target_assignment(matches)
-    return matches
+    return collapse_duplicate_source_text(dedupe_equivalent_matches(matches))
 
 
 def match_objects_with_llm(
@@ -3230,6 +4203,11 @@ def pipeline_report(
     ai_ocr_max_retries: int,
     ai_ocr_cache_dir: Path,
     ai_ocr_use_cache: bool,
+    openai_cache_only: bool,
+    audit_db: Optional[OpenAIAuditDB],
+    restore_object_match_from_db_cache: bool,
+    restore_semantic_check_from_db_cache: bool,
+    write_stage_cache_to_db: bool,
     object_match_model: str,
     object_match_timeout_sec: int,
     object_match_max_retries: int,
@@ -3240,6 +4218,7 @@ def pipeline_report(
     classic_ocr_min_conf: int,
     image_name_filter: Optional[str] = None,
     audit_log: Optional[AIAuditLog] = None,
+    llm_workers: int = 1,
 ) -> PipelineReport:
     target_files = list_images(target_dir, SUPPORTED_EXTENSIONS)
     if image_name_filter:
@@ -3258,7 +4237,9 @@ def pipeline_report(
     run_ai = should_run_ai_ocr(ocr_engine)
     ai_required = ocr_engine in {"ai", "hybrid", "triangulated", "ai_validated"}
     llm_required = ocr_engine in {"classic_llm", "triangulated"} or (matching_mode == "llm_objects" and ocr_engine != "ai_validated")
-    if (ai_required or llm_required) and not openai_api_key:
+    if openai_cache_only and ocr_engine != "ai_validated":
+        raise ValueError("--openai-cache-only is currently supported for --ocr-engine ai_validated.")
+    if (ai_required or llm_required) and not openai_api_key and not (openai_cache_only and ocr_engine == "ai_validated"):
         if fallback_to_classic:
             logging.warning("OpenAI API key missing; falling back to classic OCR where possible.")
             run_llm = False
@@ -3266,10 +4247,16 @@ def pipeline_report(
             matching_mode = "positional"
         else:
             raise ValueError("AI processing requires an OpenAI API key. Pass --openai-api-key or set OPENAI_API_KEY.")
+    if openai_cache_only:
+        logging.info("OpenAI cache-only mode enabled; live OpenAI calls are disabled.")
+        run_llm = False
+    if llm_workers > 1:
+        logging.info("Parallel LLM workers enabled: %d", llm_workers)
 
     temp_dir_ctx = tempfile.TemporaryDirectory(prefix="ocr_local_") if use_temp_local else None
     temp_root = Path(temp_dir_ctx.name) if temp_dir_ctx else None
-    render_root = rendered_image_dir if write_rendered_images else Path(tempfile.mkdtemp(prefix="ocr_render_batch_"))
+    render_tmp_ctx = tempfile.TemporaryDirectory(prefix="ocr_render_batch_") if not write_rendered_images else None
+    render_root = rendered_image_dir if write_rendered_images else Path(render_tmp_ctx.name)
     render_root.mkdir(parents=True, exist_ok=True)
 
     image_pairs: List[ImagePair] = []
@@ -3277,6 +4264,7 @@ def pipeline_report(
     all_tokens: List[OCRToken] = []
     llm_results: List[OCRNormalizedResult] = []
     ai_results: List[OCRNormalizedResult] = []
+    raw_ocr_full_text: List[Dict[str, Any]] = []
     triangulation_rows: List[OCRTriangulationRow] = []
     final_matches: List[GUIMatch] = []
     cache_counts = {"llm_hit": 0, "llm_miss": 0, "ai_hit": 0, "ai_miss": 0}
@@ -3339,6 +4327,19 @@ def pipeline_report(
                 logging.warning("Source classic OCR error [%s]: %s", src_path.name, src_err)
             all_lines.extend(src_classic.classic_lines)
             all_tokens.extend(src_classic.classic_tokens)
+            for pass_name, full_text in src_classic.full_text_by_pass.items():
+                raw_ocr_full_text.append(
+                    {
+                        "pair_id": pair_id,
+                        "side": "source",
+                        "image_filename": src_path.name,
+                        "ocr_pass": pass_name,
+                        "selected_pass": any(
+                            line.selected_pass and line.ocr_pass == pass_name for line in src_classic.classic_lines
+                        ),
+                        "full_ocr_text": full_text,
+                    }
+                )
             if trg_local:
                 trg_classic, trg_err = extract_classic_ocr_evidence(
                     trg_local,
@@ -3356,6 +4357,19 @@ def pipeline_report(
                     logging.warning("Target classic OCR error [%s]: %s", trg_path.name if trg_path else "", trg_err)
                 all_lines.extend(trg_classic.classic_lines)
                 all_tokens.extend(trg_classic.classic_tokens)
+                for pass_name, full_text in trg_classic.full_text_by_pass.items():
+                    raw_ocr_full_text.append(
+                        {
+                            "pair_id": pair_id,
+                            "side": "target",
+                            "image_filename": trg_path.name if trg_path else "",
+                            "ocr_pass": pass_name,
+                            "selected_pass": any(
+                                line.selected_pass and line.ocr_pass == pass_name for line in trg_classic.classic_lines
+                            ),
+                            "full_ocr_text": full_text,
+                        }
+                    )
             if not pair.classic_ocr_status:
                 pair.classic_ocr_status = "ok"
 
@@ -3363,39 +4377,87 @@ def pipeline_report(
         trg_llm: Optional[OCRNormalizedResult] = None
         if run_llm:
             try:
-                src_llm = normalize_ocr_with_llm(
+                src_args = (
                     src_path.name,
                     "en",
                     "English",
                     "source",
                     src_classic,
-                    llm_ocr_model,
-                    openai_api_key or "",
-                    llm_ocr_timeout_sec,
-                    llm_ocr_max_retries,
-                    llm_ocr_cache_dir,
-                    llm_ocr_use_cache,
-                    audit=audit_log,
-                    pair_id=pair_id,
                 )
-                cache_counts["llm_hit" if src_llm.cached else "llm_miss"] += 1
-                llm_results.append(src_llm)
-                if trg_local:
-                    trg_llm = normalize_ocr_with_llm(
-                        trg_path.name if trg_path else "",
-                        lang_code,
-                        lang_name,
-                        "target",
-                        trg_classic,
+                trg_args = (
+                    (trg_path.name if trg_path else ""),
+                    lang_code,
+                    lang_name,
+                    "target",
+                    trg_classic,
+                )
+                if llm_workers > 1 and trg_local:
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        fut_src = ex.submit(
+                            normalize_ocr_with_llm,
+                            *src_args,
+                            llm_ocr_model,
+                            openai_api_key or "",
+                            llm_ocr_timeout_sec,
+                            llm_ocr_max_retries,
+                            llm_ocr_cache_dir,
+                            llm_ocr_use_cache,
+                            audit_db,
+                            True,
+                            write_stage_cache_to_db,
+                            audit_log,
+                            pair_id,
+                        )
+                        fut_trg = ex.submit(
+                            normalize_ocr_with_llm,
+                            *trg_args,
+                            llm_ocr_model,
+                            openai_api_key or "",
+                            llm_ocr_timeout_sec,
+                            llm_ocr_max_retries,
+                            llm_ocr_cache_dir,
+                            llm_ocr_use_cache,
+                            audit_db,
+                            True,
+                            write_stage_cache_to_db,
+                            audit_log,
+                            pair_id,
+                        )
+                        src_llm = fut_src.result()
+                        trg_llm = fut_trg.result()
+                else:
+                    src_llm = normalize_ocr_with_llm(
+                        *src_args,
                         llm_ocr_model,
                         openai_api_key or "",
                         llm_ocr_timeout_sec,
                         llm_ocr_max_retries,
                         llm_ocr_cache_dir,
                         llm_ocr_use_cache,
+                        audit_db=audit_db,
+                        restore_from_db_cache=True,
+                        write_to_db_cache=write_stage_cache_to_db,
                         audit=audit_log,
                         pair_id=pair_id,
                     )
+                    if trg_local:
+                        trg_llm = normalize_ocr_with_llm(
+                            *trg_args,
+                            llm_ocr_model,
+                            openai_api_key or "",
+                            llm_ocr_timeout_sec,
+                            llm_ocr_max_retries,
+                            llm_ocr_cache_dir,
+                            llm_ocr_use_cache,
+                            audit_db=audit_db,
+                            restore_from_db_cache=True,
+                            write_to_db_cache=write_stage_cache_to_db,
+                            audit=audit_log,
+                            pair_id=pair_id,
+                        )
+                cache_counts["llm_hit" if src_llm.cached else "llm_miss"] += 1
+                llm_results.append(src_llm)
+                if trg_llm:
                     cache_counts["llm_hit" if trg_llm.cached else "llm_miss"] += 1
                     llm_results.append(trg_llm)
                 pair.llm_ocr_normalization_status = "ok"
@@ -3410,42 +4472,97 @@ def pipeline_report(
         trg_ai: Optional[OCRNormalizedResult] = None
         if run_ai:
             try:
-                if src_rendered:
-                    src_ai = ai_image_ocr(
-                        src_rendered,
-                        src_path.name,
-                        "en",
-                        "English",
-                        "source",
-                        ai_ocr_model,
-                        ai_ocr_detail,
-                        openai_api_key or "",
-                        ai_ocr_timeout_sec,
-                        ai_ocr_max_retries,
-                        ai_ocr_cache_dir,
-                        ai_ocr_use_cache,
-                        audit=audit_log,
-                        pair_id=pair_id,
-                    )
+                src_ai_args = (
+                    src_rendered,
+                    src_path.name,
+                    "en",
+                    "English",
+                    "source",
+                )
+                trg_ai_args = (
+                    trg_rendered,
+                    (trg_path.name if trg_path else ""),
+                    lang_code,
+                    lang_name,
+                    "target",
+                )
+                if llm_workers > 1 and src_rendered and trg_rendered and trg_path:
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        fut_src = ex.submit(
+                            ai_image_ocr,
+                            *src_ai_args,
+                            ai_ocr_model,
+                            ai_ocr_detail,
+                            openai_api_key or "",
+                            ai_ocr_timeout_sec,
+                            ai_ocr_max_retries,
+                            ai_ocr_cache_dir,
+                            ai_ocr_use_cache,
+                            openai_cache_only,
+                            audit_db,
+                            True,
+                            write_stage_cache_to_db,
+                            audit_log,
+                            pair_id,
+                        )
+                        fut_trg = ex.submit(
+                            ai_image_ocr,
+                            *trg_ai_args,
+                            ai_ocr_model,
+                            ai_ocr_detail,
+                            openai_api_key or "",
+                            ai_ocr_timeout_sec,
+                            ai_ocr_max_retries,
+                            ai_ocr_cache_dir,
+                            ai_ocr_use_cache,
+                            openai_cache_only,
+                            audit_db,
+                            True,
+                            write_stage_cache_to_db,
+                            audit_log,
+                            pair_id,
+                        )
+                        src_ai = fut_src.result()
+                        trg_ai = fut_trg.result()
+                else:
+                    if src_rendered:
+                        src_ai = ai_image_ocr(
+                            *src_ai_args,
+                            ai_ocr_model,
+                            ai_ocr_detail,
+                            openai_api_key or "",
+                            ai_ocr_timeout_sec,
+                            ai_ocr_max_retries,
+                            ai_ocr_cache_dir,
+                            ai_ocr_use_cache,
+                            cache_only=openai_cache_only,
+                            audit_db=audit_db,
+                            restore_from_db_cache=True,
+                            write_to_db_cache=write_stage_cache_to_db,
+                            audit=audit_log,
+                            pair_id=pair_id,
+                        )
+                    if trg_rendered and trg_path:
+                        trg_ai = ai_image_ocr(
+                            *trg_ai_args,
+                            ai_ocr_model,
+                            ai_ocr_detail,
+                            openai_api_key or "",
+                            ai_ocr_timeout_sec,
+                            ai_ocr_max_retries,
+                            ai_ocr_cache_dir,
+                            ai_ocr_use_cache,
+                            cache_only=openai_cache_only,
+                            audit_db=audit_db,
+                            restore_from_db_cache=True,
+                            write_to_db_cache=write_stage_cache_to_db,
+                            audit=audit_log,
+                            pair_id=pair_id,
+                        )
+                if src_ai:
                     cache_counts["ai_hit" if src_ai.cached else "ai_miss"] += 1
                     ai_results.append(src_ai)
-                if trg_rendered and trg_path:
-                    trg_ai = ai_image_ocr(
-                        trg_rendered,
-                        trg_path.name,
-                        lang_code,
-                        lang_name,
-                        "target",
-                        ai_ocr_model,
-                        ai_ocr_detail,
-                        openai_api_key or "",
-                        ai_ocr_timeout_sec,
-                        ai_ocr_max_retries,
-                        ai_ocr_cache_dir,
-                        ai_ocr_use_cache,
-                        audit=audit_log,
-                        pair_id=pair_id,
-                    )
+                if trg_ai:
                     cache_counts["ai_hit" if trg_ai.cached else "ai_miss"] += 1
                     ai_results.append(trg_ai)
                 pair.ai_image_ocr_status = "ok"
@@ -3453,7 +4570,7 @@ def pipeline_report(
                 error_counts["ai"] += 1
                 pair.ai_image_ocr_status = f"error: {exc}"
                 logging.exception("AI image OCR failed for pair %s", pair_id)
-                if not fallback_to_classic:
+                if not fallback_to_classic or openai_cache_only:
                     raise
 
         if not (src_llm or src_ai):
@@ -3481,9 +4598,16 @@ def pipeline_report(
                         source_classic=src_classic,
                         target_classic=trg_classic,
                         model=object_match_model,
-                        api_key=openai_api_key,
+                        api_key=None if openai_cache_only else openai_api_key,
                         timeout_sec=object_match_timeout_sec,
                         max_retries=object_match_max_retries,
+                        audit=audit_log,
+                        audit_db=audit_db,
+                        restore_object_match_from_db_cache=restore_object_match_from_db_cache,
+                        write_object_match_to_db_cache=write_stage_cache_to_db,
+                        restore_semantic_check_from_db_cache=restore_semantic_check_from_db_cache,
+                        write_semantic_check_to_db_cache=write_stage_cache_to_db,
+                        parallel_workers=max(1, llm_workers),
                     )
                 )
             elif matching_mode == "llm_objects" and openai_api_key:
@@ -3539,6 +4663,19 @@ def pipeline_report(
 
     if temp_dir_ctx:
         temp_dir_ctx.cleanup()
+    if render_tmp_ctx:
+        render_tmp_ctx.cleanup()
+
+    if ocr_engine == "ai_validated":
+        needs_review_count = sum(1 for m in final_matches if m.status == "needs_review")
+        uncertain_count = sum(1 for m in final_matches if m.status == "uncertain")
+        unmatched_count = sum(1 for m in final_matches if m.status == "unmatched")
+        tri_disagree_count = 0
+    else:
+        needs_review_count = sum(1 for m in final_matches if m.status == "needs_review") + sum(1 for r in triangulation_rows if r.needs_review)
+        uncertain_count = sum(1 for m in final_matches if m.status == "uncertain")
+        unmatched_count = sum(1 for m in final_matches if m.status == "unmatched")
+        tri_disagree_count = sum(1 for r in triangulation_rows if r.agreement_status == "disagree")
 
     summary = {
         "run timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -3554,23 +4691,23 @@ def pipeline_report(
         "AI image OCR detail": ai_ocr_detail,
         "AI image OCR prompt version": AI_IMAGE_OCR_PROMPT_VERSION,
         "GUI match prompt version": GUI_OBJECT_MATCH_PROMPT_VERSION,
-        "source image count": len(source_files),
-        "matched image pair count": sum(1 for p in image_pairs if p.target_image_filename),
-        "missing image pair count": sum(1 for p in image_pairs if not p.target_image_filename),
-        "classic OCR error count": error_counts["classic"],
-        "LLM OCR-normalization error count": error_counts["llm"],
-        "AI image OCR error count": error_counts["ai"],
-        "triangulation disagreement count": sum(1 for r in triangulation_rows if r.agreement_status == "disagree"),
-        "final matched string count": sum(1 for m in final_matches if m.status == "matched"),
-        "needs_review count": sum(1 for m in final_matches if m.status == "needs_review") + sum(1 for r in triangulation_rows if r.needs_review),
-        "uncertain count": sum(1 for m in final_matches if m.status == "uncertain"),
-        "unmatched count": sum(1 for m in final_matches if m.status == "unmatched"),
-        "LLM normalization cache hit count": cache_counts["llm_hit"],
-        "LLM normalization cache miss count": cache_counts["llm_miss"],
-        "AI OCR cache hit count": cache_counts["ai_hit"],
-        "AI OCR cache miss count": cache_counts["ai_miss"],
+        "source image count": int(len(source_files)),
+        "matched image pair count": int(sum(1 for p in image_pairs if p.target_image_filename)),
+        "missing image pair count": int(sum(1 for p in image_pairs if not p.target_image_filename)),
+        "classic OCR error count": int(error_counts["classic"]),
+        "LLM OCR-normalization error count": int(error_counts["llm"]),
+        "AI image OCR error count": int(error_counts["ai"]),
+        "triangulation disagreement count": int(tri_disagree_count),
+        "final matched string count": int(sum(1 for m in final_matches if m.status == "matched")),
+        "needs_review count": int(needs_review_count),
+        "uncertain count": int(uncertain_count),
+        "unmatched count": int(unmatched_count),
+        "LLM normalization cache hit count": int(cache_counts["llm_hit"]),
+        "LLM normalization cache miss count": int(cache_counts["llm_miss"]),
+        "AI OCR cache hit count": int(cache_counts["ai_hit"]),
+        "AI OCR cache miss count": int(cache_counts["ai_miss"]),
     }
-    return PipelineReport(image_pairs, all_lines, all_tokens, llm_results, ai_results, triangulation_rows, final_matches, summary)
+    return PipelineReport(image_pairs, all_lines, all_tokens, raw_ocr_full_text, llm_results, ai_results, triangulation_rows, final_matches, summary)
 
 
 def rows_from_normalized_results(results: Sequence[OCRNormalizedResult], engine: str) -> List[Dict[str, Any]]:
@@ -3609,10 +4746,13 @@ def rows_from_normalized_results(results: Sequence[OCRNormalizedResult], engine:
     return rows
 
 
-def write_multi_sheet_report(report: PipelineReport, output: Path) -> None:
+def write_multi_sheet_report(report: PipelineReport, output: Path, om_strings_xlsx: Optional[Path] = None) -> None:
     def _sanitize_excel_value(value: Any) -> Any:
         if isinstance(value, str):
-            return ILLEGAL_CHARACTERS_RE.sub("", value)
+            cleaned = ILLEGAL_CHARACTERS_RE.sub("", value)
+            if cleaned.startswith(("=", "+", "-", "@")):
+                cleaned = "'" + cleaned
+            return cleaned
         return value
 
     def _sanitize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3621,21 +4761,64 @@ def write_multi_sheet_report(report: PipelineReport, output: Path) -> None:
             cleaned.append({k: _sanitize_excel_value(v) for k, v in row.items()})
         return cleaned
 
+    def _summary_rows(summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for k, v in summary.items():
+            value = v
+            if "count" in str(k).lower():
+                try:
+                    value = str(int(v))
+                except Exception:
+                    value = "0"
+            rows.append({"metric": k, "value": value})
+        return rows
+
     output.parent.mkdir(parents=True, exist_ok=True)
-    sheets = {
-        "Image pairs": _sanitize_rows([model_to_dict(p) for p in report.image_pairs]),
-        "Raw OCR - Classic Lines": _sanitize_rows([model_to_dict(x) for x in report.classic_lines]),
-        "Raw OCR - Classic Tokens": _sanitize_rows([model_to_dict(x) for x in report.classic_tokens]),
-        "LLM OCR Normalized Objects": _sanitize_rows(rows_from_normalized_results(report.llm_results, "llm_ocr_normalization")),
-        "AI Image OCR Objects": _sanitize_rows(rows_from_normalized_results(report.ai_results, "ai_image_ocr")),
-        "OCR Triangulation": _sanitize_rows([model_to_dict(x) for x in report.triangulation_rows]),
-        "Final Matches": _sanitize_rows([model_to_dict(x) for x in report.final_matches]),
-        "Summary": _sanitize_rows([{"metric": k, "value": v} for k, v in report.summary.items()]),
-    }
+    ocr_engine = str(report.summary.get("ocr_engine", ""))
+    if ocr_engine == "ai_validated":
+        pair_path_map = {
+            (p.source_image_filename, p.target_image_filename or ""): (p.source_image_path, p.target_image_path or "")
+            for p in report.image_pairs
+        }
+        final_rows: List[Dict[str, Any]] = []
+        for match in report.final_matches:
+            row = model_to_dict(match)
+            src_p, tgt_p = pair_path_map.get((match.source_image_filename, match.target_image_filename), ("", ""))
+            row["source_image_path"] = src_p
+            row["target_image_path"] = tgt_p
+            final_rows.append(row)
+        om_rows = build_om_strings_rows(report, om_strings_xlsx) if om_strings_xlsx else []
+        sheets = {
+            "OM strings": _sanitize_rows(om_rows),
+            "Final Matches": _sanitize_rows(final_rows),
+            "AI Image OCR Objects": _sanitize_rows(rows_from_normalized_results(report.ai_results, "ai_image_ocr")),
+            "Image pairs": _sanitize_rows([model_to_dict(p) for p in report.image_pairs]),
+            "Summary": _sanitize_rows(_summary_rows(report.summary)),
+            "Raw OCR Full Text": _sanitize_rows(report.raw_ocr_full_text),
+        }
+    else:
+        sheets = {
+            "Image pairs": _sanitize_rows([model_to_dict(p) for p in report.image_pairs]),
+            "Raw OCR - Classic Lines": _sanitize_rows([model_to_dict(x) for x in report.classic_lines]),
+            "Raw OCR - Classic Tokens": _sanitize_rows([model_to_dict(x) for x in report.classic_tokens]),
+            "LLM OCR Normalized Objects": _sanitize_rows(rows_from_normalized_results(report.llm_results, "llm_ocr_normalization")),
+            "AI Image OCR Objects": _sanitize_rows(rows_from_normalized_results(report.ai_results, "ai_image_ocr")),
+            "OCR Triangulation": _sanitize_rows([model_to_dict(x) for x in report.triangulation_rows]),
+            "Final Matches": _sanitize_rows([model_to_dict(x) for x in report.final_matches]),
+            "Summary": _sanitize_rows(_summary_rows(report.summary)),
+        }
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for name, rows in sheets.items():
             pd.DataFrame(rows).to_excel(writer, sheet_name=name[:31], index=False)
     set_multi_sheet_excel_formatting(output)
+    if ocr_engine == "ai_validated":
+        from openpyxl import load_workbook
+        wb = load_workbook(output)
+        if "Raw OCR Full Text" in wb.sheetnames:
+            wb["Raw OCR Full Text"].sheet_state = "hidden"
+        sheet_order = ["OM strings", "Final Matches", "AI Image OCR Objects", "Image pairs", "Summary", "Raw OCR Full Text"]
+        wb._sheets.sort(key=lambda ws: sheet_order.index(ws.title) if ws.title in sheet_order else 999)
+        wb.save(output)
 
 
 def set_multi_sheet_excel_formatting(output_file: Path) -> None:
@@ -3703,6 +4886,34 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
                 f"A2:{max_col}{ws.max_row}",
                 FormulaRule(formula=[f"${letter}2=TRUE"], stopIfTrue=False, fill=fills["warning_red"]),
             )
+        # Add clickable local file hyperlinks when path columns are available.
+        if ws.title == "Final Matches":
+            src_name_col = header_to_col.get("source_image_filename")
+            tgt_name_col = header_to_col.get("target_image_filename")
+            src_path_col = header_to_col.get("source_image_path")
+            tgt_path_col = header_to_col.get("target_image_path")
+            if src_name_col and src_path_col:
+                for row_idx in range(2, ws.max_row + 1):
+                    name_cell = ws.cell(row=row_idx, column=src_name_col)
+                    path_cell = ws.cell(row=row_idx, column=src_path_col)
+                    path_val = str(path_cell.value or "").strip()
+                    if path_val:
+                        try:
+                            name_cell.hyperlink = Path(path_val).resolve().as_uri()
+                            name_cell.style = "Hyperlink"
+                        except Exception:
+                            pass
+            if tgt_name_col and tgt_path_col:
+                for row_idx in range(2, ws.max_row + 1):
+                    name_cell = ws.cell(row=row_idx, column=tgt_name_col)
+                    path_cell = ws.cell(row=row_idx, column=tgt_path_col)
+                    path_val = str(path_cell.value or "").strip()
+                    if path_val:
+                        try:
+                            name_cell.hyperlink = Path(path_val).resolve().as_uri()
+                            name_cell.style = "Hyperlink"
+                        except Exception:
+                            pass
     wb.save(output_file)
 
 
@@ -3756,13 +4967,30 @@ def main() -> None:
     parser.add_argument("--write-rendered-images", action="store_true")
     parser.add_argument("--rendered-image-dir", type=Path, default=Path("rendered_images"))
     parser.add_argument("--ai-audit-html", type=Path, default=None, help="HTML file for readable AI request/response audit logging.")
+    parser.add_argument(
+        "--om-strings-xlsx",
+        type=Path,
+        default=Path("input/OM_strings_EN.xlsx"),
+        help="Optional OM English strings workbook used to generate the 'OM strings' worksheet in ai_validated mode.",
+    )
     parser.add_argument("--disable-ai-audit-html", action="store_true", help="Disable AI request/response HTML audit generation.")
     parser.add_argument("--image-name", default=None, help="Optional source image filename filter for test runs.")
     parser.add_argument("--use-llm-matching", action="store_true", help="Use OpenAI LLM matching instead of positional line alignment.")
     parser.add_argument("--openai-model", default="gpt-4.1-mini", help="OpenAI model for LLM GUI string matching.")
     parser.add_argument("--openai-api-key", default=None, help="OpenAI API key. Falls back to OPENAI_API_KEY.")
+    parser.add_argument(
+        "--openai-cache-only",
+        action="store_true",
+        help="Use cached AI OCR outputs only and never call OpenAI; ai_validated matching falls back to local rules.",
+    )
+    parser.add_argument("--openai-audit-db", type=Path, default=Path(".openai_audit.sqlite"), help="SQLite database for OpenAI request/response audit and stage caches.")
+    parser.add_argument("--disable-openai-audit-db", action="store_true", help="Disable SQLite OpenAI audit/cache database.")
+    parser.add_argument("--restore-object-match-from-db-cache", action="store_true", help="Restore ai_validated object matching from SQLite cache when available.")
+    parser.add_argument("--restore-semantic-check-from-db-cache", action="store_true", help="Restore semantic quality checks from SQLite cache when available.")
+    parser.add_argument("--disable-db-stage-cache-write", action="store_true", help="Do not write stage cache entries into SQLite DB.")
     parser.add_argument("--llm-timeout-sec", type=int, default=45, help="Timeout for each LLM request.")
     parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retry count for each LLM request.")
+    parser.add_argument("--llm-workers", type=int, default=1, help="Parallel workers for independent source/target LLM stages per pair (2 recommended).")
     parser.add_argument("--output", type=Path, default=Path("ocr_match_report.xlsx"), help="Excel output path.")
     parser.add_argument("--log-file", type=Path, default=Path("ocr_match_report.log"), help="Log file path.")
     parser.add_argument("--use-temp-local-copy", action="store_true", help="Copy files to local temp folder before OCR.")
@@ -3773,7 +5001,7 @@ def main() -> None:
     configure_logging(args.log_file, args.verbose)
     logging.info("Starting discovery under root: %s", args.root.resolve())
 
-    openai_api_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY")
+    openai_api_key = None if args.openai_cache_only else (args.openai_api_key or os.environ.get("OPENAI_API_KEY"))
     if args.use_llm_matching and not openai_api_key:
         raise ValueError(
             "LLM matching requires an OpenAI API key. Pass --openai-api-key or set OPENAI_API_KEY."
@@ -3829,6 +5057,24 @@ def main() -> None:
     logging.info("Variant fallback rule: accept same section/item when only the final variant suffix differs.")
     logging.info("Optional fallback rule: fuzzy filename match on language-normalized stem when --allow-fuzzy is set.")
 
+    audit_db: Optional[OpenAIAuditDB] = None
+    if not args.disable_openai_audit_db:
+        try:
+            audit_db = OpenAIAuditDB(args.openai_audit_db)
+            audit_db.start_run(
+                {
+                    "root": str(args.root.resolve()),
+                    "target_lang": args.target_lang,
+                    "ocr_engine": args.ocr_engine,
+                    "matching_mode": args.matching_mode,
+                    "cache_only": bool(args.openai_cache_only),
+                }
+            )
+            logging.info("OpenAI audit DB enabled: %s (run_id=%s)", args.openai_audit_db.resolve(), audit_db.run_id)
+        except Exception as exc:
+            logging.warning("Failed to initialize OpenAI audit DB (%s). Continuing without DB. Error: %s", args.openai_audit_db, exc)
+            audit_db = None
+
     if args.report_format == "multi_sheet":
         lang_code = args.target_lang.lower()
         lang_name = language_name_from_dir(lang_code, lang_dirs[lang_code])
@@ -3862,6 +5108,11 @@ def main() -> None:
             ai_ocr_max_retries=args.ai_ocr_max_retries,
             ai_ocr_cache_dir=args.ai_ocr_cache_dir,
             ai_ocr_use_cache=not args.ai_ocr_no_cache,
+            openai_cache_only=args.openai_cache_only,
+            audit_db=audit_db,
+            restore_object_match_from_db_cache=args.restore_object_match_from_db_cache,
+            restore_semantic_check_from_db_cache=args.restore_semantic_check_from_db_cache,
+            write_stage_cache_to_db=not args.disable_db_stage_cache_write,
             object_match_model=args.openai_model,
             object_match_timeout_sec=args.llm_timeout_sec,
             object_match_max_retries=args.llm_max_retries,
@@ -3872,12 +5123,15 @@ def main() -> None:
             classic_ocr_min_conf=args.classic_ocr_min_conf,
             image_name_filter=args.image_name,
             audit_log=audit_log,
+            llm_workers=max(1, int(args.llm_workers)),
         )
-        write_multi_sheet_report(report, args.output)
+        write_multi_sheet_report(report, args.output, om_strings_xlsx=args.om_strings_xlsx)
         if audit_log is not None:
             audit_path = args.ai_audit_html or args.output.with_name(f"{args.output.stem}_ai_audit.html")
             audit_log.write_html(audit_path)
             logging.info("AI audit HTML written: %s", audit_path.resolve())
+        if audit_db is not None:
+            audit_db.close()
         logging.info("Excel report written: %s", args.output.resolve())
         return
 
@@ -3907,6 +5161,8 @@ def main() -> None:
     with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
     set_excel_formatting(args.output)
+    if audit_db is not None:
+        audit_db.close()
     logging.info("Excel report written: %s", args.output.resolve())
 
 

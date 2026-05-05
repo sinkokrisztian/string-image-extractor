@@ -119,6 +119,7 @@ class TriangulatedPipelineTests(unittest.TestCase):
             image_pairs=[pair],
             classic_lines=[],
             classic_tokens=[],
+            raw_ocr_full_text=[],
             llm_results=[],
             ai_results=[],
             triangulation_rows=[],
@@ -147,6 +148,55 @@ class TriangulatedPipelineTests(unittest.TestCase):
         self.assertIn(status, {"confirmed", "weakly_confirmed"})
         status2, _reason2 = report.corroborate_with_raw_ocr("Forgalom", evidence)
         self.assertEqual(status2, "not_confirmed")
+
+    def test_short_warning_status_is_matchable(self):
+        src_warning = report.NormalizedGUIObject(
+            object_id="s1",
+            normalized_text="BRAKE",
+            gui_role="status_bar",
+            reading_order=1,
+            row_group=1,
+            screen_area="bottom",
+            ocr_evidence_confidence=0.95,
+            normalization_confidence=0.95,
+            is_translatable_gui_string=True,
+        )
+        trg_warning = report.NormalizedGUIObject(
+            object_id="t1",
+            normalized_text="F\u00c9K!",
+            gui_role="status_bar",
+            reading_order=1,
+            row_group=1,
+            screen_area="bottom",
+            ocr_evidence_confidence=0.99,
+            normalization_confidence=0.99,
+            is_translatable_gui_string=True,
+        )
+        self.assertEqual(report.classify_object_lane(src_warning), "translatable_gui")
+        self.assertEqual(report.classify_object_lane(trg_warning), "translatable_gui")
+
+        source_ai = self._ai_result("source", "enis07ct033a.eps", "en", "English", [src_warning])
+        target_ai = self._ai_result("target", "huis07ct033a.eps", "hu", "Hungarian", [trg_warning])
+        src_classic = report.ClassicOCRResult([], [], [], "", [], {"psm11_bw": "BRAKE"})
+        trg_classic = report.ClassicOCRResult([], [], [], "", [], {"psm11_bw": "Kdi F\u00c9K\nFEK"})
+        out = report.ai_validated_matches(
+            pair_id="0110",
+            source_image="enis07ct033a.eps",
+            target_image="huis07ct033a.eps",
+            target_language_name="Hungarian",
+            source_ai=source_ai,
+            target_ai=target_ai,
+            source_classic=src_classic,
+            target_classic=trg_classic,
+            model="gpt-4.1-mini",
+            api_key=None,
+            timeout_sec=1,
+            max_retries=0,
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].source_text, "BRAKE")
+        self.assertEqual(out[0].target_text, "F\u00c9K!")
+        self.assertIn(out[0].raw_ocr_validation_status, {"confirmed", "weakly_confirmed"})
 
     def test_no_target_reuse_in_accepted_rows(self):
         matches = [

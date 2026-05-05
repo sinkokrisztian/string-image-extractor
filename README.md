@@ -23,6 +23,8 @@ OCR and bilingual GUI-string matching pipeline for automotive screenshot assets 
 ## Documentation
 
 - Plan: `docs/codex_triangulated_ai_ocr_implementation_plan.md`
+- Simplified AI-validated plan: `docs/codex_ai_ocr_simplified_implementation_plan.md`
 - Quality evaluation: `docs/quality_evaluation.md`
 - Output glossary: `docs/output_glossary.md`
+- Windows installer build: `docs/installer_build.md`
 - Change history: `CHANGELOG.md`
