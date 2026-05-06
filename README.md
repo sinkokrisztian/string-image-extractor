@@ -17,8 +17,8 @@ OCR and bilingual GUI-string matching pipeline for automotive screenshot assets 
    - PowerShell: `$env:OPENAI_API_KEY=\"...\"`
 4. Run GUI:
    - `python src/ocr_report_gui.py`
-5. Or run CLI example (triangulated EN->HU):
-   - `python src/image_ocr_match_report.py --root . --source-prefix enis --target-lang hu --source-ocr-lang eng --target-ocr-lang hun --ocr-engine triangulated --report-format multi_sheet --matching-mode llm_objects --llm-ocr-normalization-model gpt-4.1-mini --ai-ocr-model gpt-4.1-mini --openai-model gpt-4.1-mini --fallback-to-classic --output report_gui.xlsx --log-file report_gui.log`
+5. Or run CLI example (AI-validated EN->HU with review package):
+   - `python src/image_ocr_match_report.py --root . --source-prefix enis --target-lang hu --source-ocr-lang eng --target-ocr-lang hun --ocr-engine ai_validated --report-format multi_sheet --matching-mode llm_objects --ai-ocr-model gpt-4.1-mini --openai-model gpt-4.1-mini --om-strings-xlsx input/MM_strings_EN.xlsx --build-review-package --output output/report_gui_ENHU.xlsx --log-file output/report_gui_ENHU.log`
 
 ## Documentation
 

@@ -11,7 +11,7 @@ if (-not (Test-Path $IssScript)) {
 
 if ([string]::IsNullOrWhiteSpace($IsccPath)) {
     $candidates = @(
-        "$env:ProgramFiles(x86)\\Inno Setup 6\\ISCC.exe",
+        "${env:ProgramFiles(x86)}\\Inno Setup 6\\ISCC.exe",
         "$env:ProgramFiles\\Inno Setup 6\\ISCC.exe"
     )
     foreach ($c in $candidates) {
@@ -27,4 +27,7 @@ if ([string]::IsNullOrWhiteSpace($IsccPath) -or -not (Test-Path $IsccPath)) {
 }
 
 & $IsccPath $IssScript
+if ($LASTEXITCODE -ne 0) {
+    throw "Inno Setup compiler failed with exit code $LASTEXITCODE."
+}
 Write-Host "Installer build finished. Output directory: dist\\installer"

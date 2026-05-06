@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.3.0 - 2026-05-06
+
+- Added automatic review-package generation for AI-validated CLI/GUI runs via `--build-review-package`, producing `to_review/MM_strings_review_ENxx.xlsx` with linked source/target PNG screenshots.
+- Added `scripts/build_review_package.py` to rebuild reviewer workbooks from finished reports, backfill `MM strings` from `input/MM_strings_EN.xlsx`, infer/accept target language codes, and apply review-friendly Excel formatting.
+- Updated GUI defaults to use the MM strings workbook and run the review-package export automatically after each target-language extraction.
+- Added a Windows file-lock diagnostic helper for blocked network-file cleanup cases.
+- Fixed Inno Setup compiler auto-detection, repository-relative installer paths, and failure propagation in the installer wrapper.
+- Updated generated-output ignore rules for audit databases, rendered images, and review-package folders.
+
 ## 2.2.0 - 2026-05-05
 
 - Hardened `ai_validated` matching for split/merged label cases (for example `Edit` + `Favourites`) and improved pair-level consistency in final matches.

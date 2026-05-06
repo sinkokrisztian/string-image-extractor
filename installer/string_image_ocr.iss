@@ -1,6 +1,6 @@
 ; Inno Setup script for String Image OCR Report GUI
 #define AppName "String Image OCR Report"
-#define AppVersion "2.2.0"
+#define AppVersion "2.3.0"
 #define AppPublisher "sinkokrisztian"
 #define AppExeName "StringImageOCRReport.exe"
 
@@ -12,7 +12,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\StringImageOCRReport
 DefaultGroupName=String Image OCR Report
 DisableProgramGroupPage=yes
-OutputDir=dist\installer
+OutputDir=..\dist\installer
 OutputBaseFilename=StringImageOCRReport_Setup_{#AppVersion}
 Compression=lzma
 SolidCompression=yes
@@ -25,7 +25,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\nuitka\StringImageOCRReport.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\nuitka\StringImageOCRReport.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\String Image OCR Report"; Filename: "{app}\{#AppExeName}"

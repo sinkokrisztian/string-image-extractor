@@ -69,7 +69,7 @@ class OCRReportGUI(BaseTk):
         self.output_var = tk.StringVar(value=str(cwd / "report_gui.xlsx"))
         self.log_var = tk.StringVar(value=str(cwd / "report_gui.log"))
         self.audit_var = tk.StringVar(value=str(cwd / "report_gui_ai_audit.html"))
-        self.om_strings_var = tk.StringVar(value=str(cwd / "input" / "OM_strings_EN.xlsx"))
+        self.om_strings_var = tk.StringVar(value=str(cwd / "input" / "MM_strings_EN.xlsx"))
         self.openai_cache_only_var = tk.BooleanVar(value=False)
         self.use_full_cache_var = tk.BooleanVar(value=True)
         self.llm_workers_var = tk.IntVar(value=2)
@@ -168,7 +168,7 @@ class OCRReportGUI(BaseTk):
         self._path_row(paths, 2, "Workbook", self.output_var, self._choose_output)
         self._path_row(paths, 3, "Log", self.log_var, self._choose_log)
         self._path_row(paths, 4, "AI audit", self.audit_var, self._choose_audit)
-        self._path_row(paths, 5, "OM strings", self.om_strings_var, self._choose_om_strings)
+        self._path_row(paths, 5, "MM strings", self.om_strings_var, self._choose_om_strings)
 
         spend = ttk.Frame(main, style="Card.TFrame", padding=14)
         spend.grid(row=0, column=1, sticky="nsew")
@@ -216,7 +216,7 @@ class OCRReportGUI(BaseTk):
         ttk.Label(parent, text="OCR engine").grid(row=0, column=2, sticky="w", padx=6, pady=6)
         ttk.Label(parent, text="ai_validated", font=("Segoe UI Semibold", 10), foreground="#0f766e").grid(row=0, column=3, sticky="w", padx=6, pady=6)
         self._entry(parent, "Image filename filter", self.image_name_var, 1, 0)
-        ttk.Label(parent, text="Run behavior: fail-fast on AI errors, temporary rendered PNGs, always-on AI audit HTML.").grid(
+        ttk.Label(parent, text="Run behavior: fail-fast on AI errors, AI audit HTML, and review package with linked PNG screenshots.").grid(
             row=2, column=0, columnspan=4, sticky="w", padx=6, pady=10
         )
         ttk.Separator(parent).grid(row=4, column=0, columnspan=4, sticky="ew", pady=8)
@@ -422,6 +422,9 @@ class OCRReportGUI(BaseTk):
             self.log_var.get(),
             "--om-strings-xlsx",
             self.om_strings_var.get(),
+            "--build-review-package",
+            "--review-root",
+            str(Path(self.root_var.get()) / "to_review"),
             "--verbose",
         ]
         if self.use_full_cache_var.get():

@@ -24,7 +24,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_installer_iss.ps1
 
 Expected output:
 
-- `dist\installer\StringImageOCRReport_Setup_2.2.0.exe`
+- `dist\installer\StringImageOCRReport_Setup_2.3.0.exe`
 
 If `ISCC.exe` is not in a default location, pass explicit path:
 

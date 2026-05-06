@@ -11,11 +11,14 @@ venv/
 # OCR/AI caches
 .ocr_ai_cache/
 .ocr_llm_norm_cache/
+.openai_audit.sqlite*
 
 # Generated reports and logs
 *.log
 *.xlsx
 *_ai_audit.html
+rendered_images/
+to_review/
 
 # Build/release artifacts
 dist/

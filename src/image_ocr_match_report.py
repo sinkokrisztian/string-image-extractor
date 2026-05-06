@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unicodedata
@@ -50,10 +51,10 @@ STRUCTURED_NAME_PATTERN = re.compile(
 )
 SUPPORTED_EXTENSIONS = {".eps", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
-SCRIPT_VERSION = "2.2.0"
+SCRIPT_VERSION = "2.3.0"
 LLM_OCR_NORMALIZATION_PROMPT_VERSION = "llm_ocr_normalization_gui_v1"
 AI_IMAGE_OCR_PROMPT_VERSION = "ai_image_ocr_gui_v1"
-GUI_OBJECT_MATCH_PROMPT_VERSION = "gui_object_match_v1"
+GUI_OBJECT_MATCH_PROMPT_VERSION = "gui_object_match_v2"
 DEFAULT_AI_MODEL = "gpt-4.1-mini"
 
 GUI_ROLES = (
@@ -2108,6 +2109,7 @@ Consistency rules for short UI labels:
 - Do not merge two English labels into one target match unless the target visibly has only one combined label.
 - If target word order is reversed (for example, source labels like "Edit" and "Favourites" vs a target phrase containing equivalents in reverse order), align by lexical meaning and assign the most specific counterpart to each source label.
 - If one source label cannot be isolated with confidence, return that row as uncertain/unmatched rather than forcing a merged match.
+- If the target object looks merged label+description and split candidates are provided (object_id suffixes like __split_label / __split_desc), prefer matching short source labels to __split_label and longer explanatory source text to __split_desc.
 
 Do not invent target text and do not translate the output yourself. Return unmatched or uncertain when a reliable counterpart is not present. Return data matching the provided schema."""
 
@@ -2757,7 +2759,7 @@ def read_om_english_strings(om_xlsx: Path) -> List[str]:
     try:
         xls = pd.ExcelFile(om_xlsx)
     except Exception as exc:
-        logging.warning("Failed to open OM strings workbook %s: %s", om_xlsx, exc)
+        logging.warning("Failed to open MM strings workbook %s: %s", om_xlsx, exc)
         return strings
     for sheet in xls.sheet_names:
         try:
@@ -2809,6 +2811,24 @@ def build_om_strings_rows(report: "PipelineReport", om_xlsx: Path) -> List[Dict[
             continue
         by_source.setdefault(key, []).append(m)
 
+    def _status_rank(status: str) -> int:
+        # Higher is better confidence/quality.
+        return {"matched": 4, "needs_review": 3, "uncertain": 2, "unmatched": 1}.get(str(status), 0)
+
+    def _merge_reasons(matches: List[GUIMatch], field: str) -> str:
+        vals: List[str] = []
+        seen = set()
+        for m in matches:
+            v = normalize_for_llm_guard(str(getattr(m, field, "") or ""))
+            if not v:
+                continue
+            key = v.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            vals.append(v)
+        return " | ".join(vals)
+
     rows: List[Dict[str, Any]] = []
     for s in om_strings:
         key = normalize_text_key(s)
@@ -2819,19 +2839,41 @@ def build_om_strings_rows(report: "PipelineReport", om_xlsx: Path) -> List[Dict[
             t = normalize_for_llm_guard(m.target_text)
             if t and t not in targets:
                 targets.append(t)
-        best_status = "not_found"
-        best_conf = 0.0
+        # Row shaping rule:
+        # - no hit => unmatched row with empty reasons
+        # - single hit => take best-first occurrence (status-preferred, then confidence)
+        # - multiple hits => force uncertain and merge rationale/reasons across candidates
+        status = "unmatched"
+        rationale = ""
+        review_reason = ""
+        semantic_check_reason = ""
         if hits:
-            best = max(hits, key=lambda m: (m.overall_confidence, m.semantic_confidence))
-            best_status = best.status
-            best_conf = best.overall_confidence
+            if len(hits) == 1:
+                best = hits[0]
+            else:
+                best = sorted(
+                    hits,
+                    key=lambda m: (_status_rank(m.status), float(m.overall_confidence), float(m.semantic_confidence)),
+                    reverse=True,
+                )[0]
+            if len(hits) == 1:
+                status = str(best.status or "unmatched")
+                rationale = normalize_for_llm_guard(str(best.rationale or ""))
+                review_reason = normalize_for_llm_guard(str(best.review_reason or ""))
+                semantic_check_reason = normalize_for_llm_guard(str(best.semantic_check_reason or ""))
+            else:
+                status = "uncertain"
+                rationale = _merge_reasons(hits, "rationale")
+                review_reason = _merge_reasons(hits, "review_reason")
+                semantic_check_reason = _merge_reasons(hits, "semantic_check_reason")
         rows.append(
             {
                 "om_en_string": s,
                 "target_equivalent_candidates": " | ".join(targets),
-                "matched_in_final_matches": bool(hits),
-                "best_match_status": best_status,
-                "best_match_confidence": round(best_conf, 3),
+                "status": status,
+                "rationale": rationale,
+                "review_reason": review_reason,
+                "semantic_check_reason": semantic_check_reason,
                 "match_count": len(hits),
             }
         )
@@ -3342,6 +3384,89 @@ def _ensure_unique_object_ids(objects: Sequence[NormalizedGUIObject], prefix: st
     return out
 
 
+SPLIT_START_CUES = (
+    " itt ",
+    " ha ",
+    " vagy ",
+    " you ",
+    " can ",
+    " explore ",
+    " connect ",
+    " csatlakozz",
+    " kedykolvek ",
+    " whenever ",
+    " when ",
+)
+
+
+def _split_merged_gui_object(obj: NormalizedGUIObject) -> List[NormalizedGUIObject]:
+    text = normalize_for_llm_guard(obj.normalized_text)
+    if not text:
+        return []
+    # Keep this conservative: only split likely merged label+description blocks.
+    if obj.gui_role not in {"button", "menu_label", "description", "other"}:
+        return []
+    if len(text) < 24 or len(text.split()) < 4:
+        return []
+    lower = f" {remove_accents(text).lower()} "
+    cut_idx = -1
+    for cue in SPLIT_START_CUES:
+        pos = lower.find(cue)
+        if pos > 1:
+            cut_idx = pos
+            break
+    if cut_idx < 0:
+        # Secondary heuristic: split before second sentence.
+        dot_pos = text.find(". ")
+        if dot_pos > 8:
+            cut_idx = dot_pos + 2
+    if cut_idx < 0:
+        return []
+    left = normalize_for_llm_guard(text[:cut_idx].strip(" ;:,."))
+    right = normalize_for_llm_guard(text[cut_idx:].strip(" ;:,."))
+    if not left or not right:
+        return []
+    if len(left.split()) > 4:
+        return []
+    if not is_label_like_value_text(left):
+        return []
+    left_obj = obj.model_copy(deep=True)
+    left_obj.object_id = f"{obj.object_id}__split_label"
+    left_obj.normalized_text = left
+    left_obj.gui_role = "menu_label" if obj.gui_role != "description" else "description"
+    left_obj.rationale = (left_obj.rationale + " | synthetic split: label").strip(" |")
+    left_obj.normalization_confidence = max(0.75, min(0.99, float(obj.normalization_confidence) * 0.95))
+
+    right_obj = obj.model_copy(deep=True)
+    right_obj.object_id = f"{obj.object_id}__split_desc"
+    right_obj.normalized_text = right
+    right_obj.gui_role = "description"
+    right_obj.rationale = (right_obj.rationale + " | synthetic split: description").strip(" |")
+    right_obj.normalization_confidence = max(0.70, min(0.99, float(obj.normalization_confidence) * 0.90))
+    return [left_obj, right_obj]
+
+
+def _augment_with_split_objects(
+    objects: Sequence[NormalizedGUIObject],
+    lane_map: Dict[str, str],
+) -> Tuple[List[NormalizedGUIObject], Dict[str, str]]:
+    out: List[NormalizedGUIObject] = []
+    out_lane = dict(lane_map)
+    for obj in objects:
+        out.append(obj)
+        split_objs = _split_merged_gui_object(obj)
+        for s in split_objs:
+            out.append(s)
+            # Both split parts are valid match candidates.
+            if s.object_id.endswith("__split_label"):
+                out_lane[s.object_id] = "translatable_gui"
+            elif s.object_id.endswith("__split_desc"):
+                out_lane[s.object_id] = "translatable_gui"
+            else:
+                out_lane[s.object_id] = out_lane.get(obj.object_id, "unknown_review")
+    return out, out_lane
+
+
 def ai_validated_matches(
     pair_id: str,
     source_image: str,
@@ -3367,6 +3492,8 @@ def ai_validated_matches(
     target_all = _ensure_unique_object_ids(target_ai.ui_objects, "tgt")
     source_lane = {o.object_id: classify_object_lane(o) for o in source_all}
     target_lane = {o.object_id: classify_object_lane(o) for o in target_all}
+    source_all, source_lane = _augment_with_split_objects(source_all, source_lane)
+    target_all, target_lane = _augment_with_split_objects(target_all, target_lane)
 
     def _expand_objects(
         objects: Sequence[NormalizedGUIObject],
@@ -3441,39 +3568,74 @@ def ai_validated_matches(
                 f"TARGET_OBJECTS: {json.dumps(target_objs_dict, ensure_ascii=False)}\n\n"
                 "Match only translatable GUI content. Do not prioritize value-only, masked, map background, or decorative/status lanes.\n"
                 "For short labels, prefer one-to-one mapping and avoid merged target assignments unless unavoidable.\n"
+                "If target candidates include synthetic split object ids (__split_label / __split_desc), map short label-like source text to __split_label and explanatory/long source text to __split_desc.\n"
                 "If target phrase appears to combine multiple labels, map each source label to the best lexical counterpart (including reversed order) or mark uncertain/unmatched."
             )
-            result = call_openai_structured(
-                api_key,
-                model,
-                system_prompt=system_prompt_gui_object_match(target_language_name),
-                user_content=[{"type": "input_text", "text": user_text}],
-                schema_model=GUIObjectMatchResponse,
-                timeout_sec=timeout_sec,
-                max_retries=max_retries,
-                audit=audit,
-                audit_db=audit_db,
-                audit_stage="AI-validated object matching",
-                audit_title=f"{pair_id} {source_image} -> {target_image}",
-                audit_prompt_version=GUI_OBJECT_MATCH_PROMPT_VERSION + "_ai_validated",
-                audit_request={
-                    "pair_id": pair_id,
-                    "source_image": source_image,
-                    "target_image": target_image,
-                    "source_objects": source_objs_dict,
-                    "target_objects": target_objs_dict,
-                },
-                audit_cache_key=object_match_cache_key,
-            )
-            assert isinstance(result, GUIObjectMatchResponse)
-            if write_object_match_to_db_cache and audit_db is not None:
-                audit_db.cache_put_model(
-                    "ai_validated_object_match",
-                    object_match_cache_key,
-                    result,
-                    metadata={"pair_id": pair_id, "model": model, "target_language_name": target_language_name},
+            try:
+                result = call_openai_structured(
+                    api_key,
+                    model,
+                    system_prompt=system_prompt_gui_object_match(target_language_name),
+                    user_content=[{"type": "input_text", "text": user_text}],
+                    schema_model=GUIObjectMatchResponse,
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                    audit=audit,
+                    audit_db=audit_db,
+                    audit_stage="AI-validated object matching",
+                    audit_title=f"{pair_id} {source_image} -> {target_image}",
+                    audit_prompt_version=GUI_OBJECT_MATCH_PROMPT_VERSION + "_ai_validated",
+                    audit_request={
+                        "pair_id": pair_id,
+                        "source_image": source_image,
+                        "target_image": target_image,
+                        "source_objects": source_objs_dict,
+                        "target_objects": target_objs_dict,
+                    },
+                    audit_cache_key=object_match_cache_key,
                 )
-            matches = validate_gui_matches(result, source_objects, target_objects)
+                assert isinstance(result, GUIObjectMatchResponse)
+                if write_object_match_to_db_cache and audit_db is not None:
+                    audit_db.cache_put_model(
+                        "ai_validated_object_match",
+                        object_match_cache_key,
+                        result,
+                        metadata={"pair_id": pair_id, "model": model, "target_language_name": target_language_name},
+                    )
+                matches = validate_gui_matches(result, source_objects, target_objects)
+            except Exception as exc:
+                logging.exception(
+                    "AI-validated object matching failed for pair %s (%s -> %s). Falling back to deterministic pairing. Error: %s",
+                    pair_id,
+                    source_image,
+                    target_image,
+                    exc,
+                )
+                matches = []
+                aligned_n = max(len(source_objects), len(target_objects))
+                for i in range(aligned_n):
+                    s_obj = source_objects[i] if i < len(source_objects) else None
+                    t_obj = target_objects[i] if i < len(target_objects) else None
+                    s = s_obj.normalized_text if s_obj else ""
+                    t = t_obj.normalized_text if t_obj else ""
+                    matches.append(
+                        GUIMatch(
+                            pair_id=pair_id,
+                            source_image_filename=source_image,
+                            target_image_filename=target_image,
+                            source_object_id=s_obj.object_id if s_obj else f"obj_{i+1:03d}",
+                            target_object_id=t_obj.object_id if t_obj else None,
+                            source_text=s,
+                            target_text=t,
+                            match_type="uncertain" if t else "unmatched",
+                            semantic_confidence=0.5 if t else 0.0,
+                            layout_confidence=0.6 if t else 0.0,
+                            overall_confidence=0.55 if t else 0.0,
+                            status="needs_review" if t else "unmatched",
+                            rationale="Deterministic fallback after AI object matching timeout/error.",
+                            review_reason="ai_object_match_timeout_or_error",
+                        )
+                    )
     else:
         # deterministic fallback
         matches = []
@@ -3519,6 +3681,7 @@ def ai_validated_matches(
                 f"REMAINING_TARGET_OBJECTS: {json.dumps(rem_target_dict, ensure_ascii=False)}\n\n"
                 "Match the remaining source GUI objects to remaining target GUI objects. "
                 "Prefer one-to-one short-label mapping, even when target word order is reversed. "
+                "Use synthetic split ids when available: short source labels -> __split_label, longer explanatory source text -> __split_desc. "
                 "If unsure, return uncertain or unmatched. Do not invent text."
             )
             try:
@@ -4789,7 +4952,7 @@ def write_multi_sheet_report(report: PipelineReport, output: Path, om_strings_xl
             final_rows.append(row)
         om_rows = build_om_strings_rows(report, om_strings_xlsx) if om_strings_xlsx else []
         sheets = {
-            "OM strings": _sanitize_rows(om_rows),
+            "MM strings": _sanitize_rows(om_rows),
             "Final Matches": _sanitize_rows(final_rows),
             "AI Image OCR Objects": _sanitize_rows(rows_from_normalized_results(report.ai_results, "ai_image_ocr")),
             "Image pairs": _sanitize_rows([model_to_dict(p) for p in report.image_pairs]),
@@ -4816,7 +4979,7 @@ def write_multi_sheet_report(report: PipelineReport, output: Path, om_strings_xl
         wb = load_workbook(output)
         if "Raw OCR Full Text" in wb.sheetnames:
             wb["Raw OCR Full Text"].sheet_state = "hidden"
-        sheet_order = ["OM strings", "Final Matches", "AI Image OCR Objects", "Image pairs", "Summary", "Raw OCR Full Text"]
+        sheet_order = ["MM strings", "Final Matches", "AI Image OCR Objects", "Image pairs", "Summary", "Raw OCR Full Text"]
         wb._sheets.sort(key=lambda ws: sheet_order.index(ws.title) if ws.title in sheet_order else 999)
         wb.save(output)
 
@@ -4829,7 +4992,6 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
         "matched": PatternFill(start_color="FFD9EAD3", end_color="FFD9EAD3", fill_type="solid"),
         "needs_review": PatternFill(start_color="FFFFF2CC", end_color="FFFFF2CC", fill_type="solid"),
         "uncertain": PatternFill(start_color="FFFCE5CD", end_color="FFFCE5CD", fill_type="solid"),
-        "unmatched": PatternFill(start_color="FFF4CCCC", end_color="FFF4CCCC", fill_type="solid"),
         "error": PatternFill(start_color="FFD9D2E9", end_color="FFD9D2E9", fill_type="solid"),
         "warning_red": PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid"),
     }
@@ -4856,7 +5018,7 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
             for key, fill in fills.items():
                 ws.conditional_formatting.add(
                     f"A2:{max_col}{ws.max_row}",
-                    FormulaRule(formula=[f'ISNUMBER(SEARCH("{key}",${letter}2))'], stopIfTrue=False, fill=fill),
+                    FormulaRule(formula=[f'${letter}2="{key}"'], stopIfTrue=False, fill=fill),
                 )
         if review_col and ws.max_row >= 2:
             letter = get_column_letter(review_col)
@@ -4917,6 +5079,56 @@ def set_multi_sheet_excel_formatting(output_file: Path) -> None:
     wb.save(output_file)
 
 
+def find_review_package_script() -> Path:
+    candidates: List[Path] = []
+    try:
+        candidates.append(Path(__file__).resolve().parents[1] / "scripts" / "build_review_package.py")
+    except Exception:
+        pass
+    candidates.append(Path.cwd() / "scripts" / "build_review_package.py")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    searched = "; ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"Review package builder script not found. Checked: {searched}")
+
+
+def build_review_package_after_report(
+    report_xlsx: Path,
+    review_root: Path,
+    mm_strings_xlsx: Path,
+    ghostscript_cmd: Optional[str],
+    dpi: int,
+    target_lang: str,
+) -> Path:
+    script = find_review_package_script()
+    cmd = [
+        sys.executable,
+        str(script),
+        "--workbooks",
+        str(report_xlsx),
+        "--review-root",
+        str(review_root),
+        "--mm-strings-xlsx",
+        str(mm_strings_xlsx),
+        "--dpi",
+        str(dpi),
+        "--target-lang",
+        target_lang,
+    ]
+    if ghostscript_cmd:
+        cmd.extend(["--ghostscript-cmd", ghostscript_cmd])
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    for line in (proc.stdout or "").splitlines():
+        logging.info("Review package: %s", line)
+    for line in (proc.stderr or "").splitlines():
+        logging.warning("Review package: %s", line)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Review package generation failed with exit code {proc.returncode}.")
+    return review_root / f"MM_strings_review_EN{target_lang.upper()}.xlsx"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Match EN screenshots to target images, OCR both, and export Excel report.")
     parser.add_argument(
@@ -4970,8 +5182,8 @@ def main() -> None:
     parser.add_argument(
         "--om-strings-xlsx",
         type=Path,
-        default=Path("input/OM_strings_EN.xlsx"),
-        help="Optional OM English strings workbook used to generate the 'OM strings' worksheet in ai_validated mode.",
+        default=Path("input/MM_strings_EN.xlsx"),
+        help="Optional MM English strings workbook used to generate the 'MM strings' worksheet in ai_validated mode.",
     )
     parser.add_argument("--disable-ai-audit-html", action="store_true", help="Disable AI request/response HTML audit generation.")
     parser.add_argument("--image-name", default=None, help="Optional source image filename filter for test runs.")
@@ -4993,6 +5205,13 @@ def main() -> None:
     parser.add_argument("--llm-workers", type=int, default=1, help="Parallel workers for independent source/target LLM stages per pair (2 recommended).")
     parser.add_argument("--output", type=Path, default=Path("ocr_match_report.xlsx"), help="Excel output path.")
     parser.add_argument("--log-file", type=Path, default=Path("ocr_match_report.log"), help="Log file path.")
+    parser.add_argument(
+        "--build-review-package",
+        action="store_true",
+        help="After the multi-sheet report is written, also build to_review/MM_strings_review_ENxx.xlsx with linked PNG images.",
+    )
+    parser.add_argument("--review-root", type=Path, default=Path("to_review"), help="Review package output root folder.")
+    parser.add_argument("--review-package-dpi", type=int, default=300, help="DPI for PNG images in the review package.")
     parser.add_argument("--use-temp-local-copy", action="store_true", help="Copy files to local temp folder before OCR.")
     parser.add_argument("--verbose", action="store_true", help="Also print log messages to console.")
     parser.add_argument("--expert-debug-mode", action="store_true", help="Allow expert/debug OCR modes like triangulated.")
@@ -5130,6 +5349,16 @@ def main() -> None:
             audit_path = args.ai_audit_html or args.output.with_name(f"{args.output.stem}_ai_audit.html")
             audit_log.write_html(audit_path)
             logging.info("AI audit HTML written: %s", audit_path.resolve())
+        if args.build_review_package:
+            review_out = build_review_package_after_report(
+                report_xlsx=args.output,
+                review_root=args.review_root,
+                mm_strings_xlsx=args.om_strings_xlsx,
+                ghostscript_cmd=ghostscript_cmd,
+                dpi=args.review_package_dpi,
+                target_lang=lang_code,
+            )
+            logging.info("Review package written: %s", review_out.resolve())
         if audit_db is not None:
             audit_db.close()
         logging.info("Excel report written: %s", args.output.resolve())
